@@ -22,11 +22,12 @@ Windows (игра) ──WASAPI loopback──> st send ──UDP/LAN──> st 
 ### Windows (уже собрано)
 
 ```powershell
-cargo build --release
+$env:CARGO_TARGET_DIR = "C:\Users\mirap\.cargo-target\soundtransfer"; cargo build --release
 # бинарник: C:\Users\mirap\.cargo-target\soundtransfer\release\st.exe
 ```
 
-(`target-dir` вынесен из OneDrive через `.cargo/config.toml`, чтобы синхронизация не мешала сборке.)
+(`CARGO_TARGET_DIR` выносит артефакты сборки из OneDrive, чтобы синхронизация не мешала.
+В репозитории этот путь не хранится — он Windows-специфичный и ломал бы сборку на Mac.)
 
 ### Mac
 
