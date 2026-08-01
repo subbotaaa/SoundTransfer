@@ -1,0 +1,4 @@
+# target/ держим вне OneDrive: многогигабайтные артефакты сборки
+# душат синхронизацию и замедляют компиляцию.
+[build]
+target-dir = "C:/Users/mirap/.cargo-target/soundtransfer"
