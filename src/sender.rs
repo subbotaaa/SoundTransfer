@@ -90,6 +90,34 @@ pub fn dump(path: &Path, seconds: f32, device: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn send_packet(
+    sock: &UdpSocket,
+    header: &mut Header,
+    pkt: &mut [u8],
+    samples: &[f32],
+    wire_format: WireFormat,
+    frames_per_packet: usize,
+    pkts_sent: &mut u64,
+    bytes_sent: &mut u64,
+) {
+    header.ptype = PacketType::Audio;
+    header.write(&mut pkt[..HEADER_LEN]);
+    match wire_format {
+        WireFormat::S16le => convert::f32_to_s16le(samples, &mut pkt[HEADER_LEN..]),
+        WireFormat::F32le => convert::f32_to_f32le(samples, &mut pkt[HEADER_LEN..]),
+    }
+    match sock.send(pkt) {
+        Ok(n) => {
+            *pkts_sent += 1;
+            *bytes_sent += n as u64;
+        }
+        Err(e) => log::warn!("send: {e}"),
+    }
+    header.seq = header.seq.wrapping_add(1);
+    header.sample_pos += frames_per_packet as u64;
+}
+
 pub fn run(opts: SendOpts, stop: Arc<AtomicBool>) -> Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:0").context("bind UDP")?;
     sock.connect(opts.target)
@@ -139,6 +167,15 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>) -> Result<()> {
     let mut pkts_sent = 0u64;
     let mut bytes_sent = 0u64;
 
+    // WASAPI loopback молчит, когда в системе тишина. Чтобы приёмник не
+    // пересобирал буфер после каждой паузы, при простое захвата синтезируем
+    // пакеты тишины, темп задаём wall-clock'ом.
+    let packet_dur = Duration::from_secs_f64(opts.frames_per_packet as f64 / fmt.sample_rate as f64);
+    let idle_threshold = Duration::from_millis(20);
+    let mut last_real_data = Instant::now();
+    let mut synth_deadline: Option<Instant> = None;
+    let zero_payload = vec![0f32; samples_per_packet];
+
     while !stop.load(Ordering::Relaxed) {
         // HELLO раз в секунду: несёт параметры формата, позволяет приёмнику
         // залочить отправителя и пересинхронизироваться после рестарта.
@@ -155,25 +192,37 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>) -> Result<()> {
 
         if cons.occupied_len() >= samples_per_packet {
             cons.pop_slice(&mut fbuf);
-            header.ptype = PacketType::Audio;
-            header.write(&mut pkt[..HEADER_LEN]);
-            match opts.wire_format {
-                WireFormat::S16le => {
-                    convert::f32_to_s16le(&fbuf, &mut pkt[HEADER_LEN..]);
-                }
-                WireFormat::F32le => {
-                    convert::f32_to_f32le(&fbuf, &mut pkt[HEADER_LEN..]);
-                }
+            last_real_data = Instant::now();
+            synth_deadline = None;
+            send_packet(
+                &sock,
+                &mut header,
+                &mut pkt,
+                &fbuf,
+                opts.wire_format,
+                opts.frames_per_packet,
+                &mut pkts_sent,
+                &mut bytes_sent,
+            );
+        } else if last_real_data.elapsed() >= idle_threshold {
+            // Захват простаивает — шлём тишину в темпе реального времени.
+            let now = Instant::now();
+            let deadline = *synth_deadline.get_or_insert(now);
+            if now >= deadline {
+                send_packet(
+                    &sock,
+                    &mut header,
+                    &mut pkt,
+                    &zero_payload,
+                    opts.wire_format,
+                    opts.frames_per_packet,
+                    &mut pkts_sent,
+                    &mut bytes_sent,
+                );
+                synth_deadline = Some(deadline + packet_dur);
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
             }
-            match sock.send(&pkt) {
-                Ok(n) => {
-                    pkts_sent += 1;
-                    bytes_sent += n as u64;
-                }
-                Err(e) => log::warn!("send: {e}"),
-            }
-            header.seq = header.seq.wrapping_add(1);
-            header.sample_pos += opts.frames_per_packet as u64;
         } else {
             std::thread::sleep(Duration::from_millis(1));
         }
