@@ -122,7 +122,13 @@ fn send_packet(
 }
 
 pub fn run(opts: SendOpts, stop: Arc<AtomicBool>, stats: Arc<SenderStats>) -> Result<()> {
-    let sock = UdpSocket::bind("0.0.0.0:0").context("bind UDP")?;
+    // Сокет должен быть того же семейства, что и адрес приёмника.
+    let bind_addr = if opts.target.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let sock = UdpSocket::bind(bind_addr).context("bind UDP")?;
     sock.connect(opts.target)
         .with_context(|| format!("connect {}", opts.target))?;
 

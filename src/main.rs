@@ -3,6 +3,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod convert;
+mod discovery;
 mod gui;
 mod jitter;
 mod protocol;
@@ -155,13 +156,25 @@ fn run_send(
     if let Some(path) = dump {
         return sender::dump(&path, seconds, device.as_deref());
     }
-    let target =
-        target.context("укажите IP приёмника: st send <ip> (или --dump для диагностики)")?;
-    let addr: SocketAddr = (target.as_str(), port)
-        .to_socket_addrs()
-        .with_context(|| format!("не удалось разрешить адрес '{target}'"))?
-        .next()
-        .context("адрес не разрешился")?;
+    let addr: SocketAddr = match target {
+        Some(target) => (target.as_str(), port)
+            .to_socket_addrs()
+            .with_context(|| format!("не удалось разрешить адрес '{target}'"))?
+            .next()
+            .context("адрес не разрешился")?,
+        None => {
+            // IP не указан — ищем приёмник в сети по mDNS.
+            log::info!("IP не указан — ищу приёмник в сети (3 с)…");
+            let found = discovery::discover(std::time::Duration::from_secs(3))?;
+            for f in &found {
+                log::info!("найден: {} — {}:{}", f.name, f.ip, f.port);
+            }
+            let first = found.first().context(
+                "приёмник не найден: запустите `st recv` на Mac или укажите IP явно",
+            )?;
+            SocketAddr::new(first.ip, first.port)
+        }
+    };
     let wire_format = match format {
         FormatArg::S16 => protocol::WireFormat::S16le,
         FormatArg::F32 => protocol::WireFormat::F32le,

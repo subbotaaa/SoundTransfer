@@ -42,6 +42,16 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> 
     sock.set_read_timeout(Some(Duration::from_millis(100)))?;
     log::info!("слушаю UDP :{} — жду отправителя…", opts.port);
 
+    // Анонс в mDNS, чтобы отправитель нашёл нас без ввода IP.
+    // Не критично: при неудаче просто работаем по прямому IP.
+    let _mdns = match crate::discovery::advertise(opts.port) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            log::warn!("mDNS-анонс не удался ({e:#}) — поиск по сети работать не будет");
+            None
+        }
+    };
+
     // Ждём первый валидный пакет: из него узнаём формат и адрес отправителя.
     let mut buf = vec![0u8; 65536];
     let (first, peer) = loop {

@@ -10,9 +10,38 @@ use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
 use eframe::egui;
 
+use crate::discovery;
 use crate::protocol::{DEFAULT_PORT, WireFormat};
 use crate::receiver;
 use crate::stats::{RateMeter, ReceiverStats, SenderStats, get_msg, set_msg};
+
+/// В Dock иконка берётся у процесса, а не у .app-бандла, поэтому
+/// выставляем её программно — работает и при запуске бинарника напрямую.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let bytes: &[u8] = include_bytes!("../assets/icon.png");
+    let data = NSData::with_bytes(bytes);
+    let app = NSApplication::sharedApplication(mtm);
+    if let Some(img) = NSImage::initWithData(NSImage::alloc(), &data) {
+        unsafe {
+            app.setApplicationIconImage(Some(&img));
+        }
+    }
+}
+
+enum Discovery {
+    Idle,
+    Searching,
+    Done(Vec<discovery::Found>),
+    Failed(String),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Mode {
@@ -83,6 +112,7 @@ pub struct App {
     pkt_rate: RateMeter,
     byte_rate: RateMeter,
     last_error: Option<String>,
+    discovery: Arc<std::sync::Mutex<Discovery>>,
 }
 
 impl App {
@@ -98,7 +128,21 @@ impl App {
             pkt_rate: RateMeter::new(),
             byte_rate: RateMeter::new(),
             last_error: None,
+            discovery: Arc::new(std::sync::Mutex::new(Discovery::Idle)),
         }
+    }
+
+    fn start_discovery(&mut self) {
+        let slot = self.discovery.clone();
+        *slot.lock().unwrap() = Discovery::Searching;
+        std::thread::spawn(move || {
+            let result = discovery::discover(Duration::from_secs(3));
+            let mut g = slot.lock().unwrap();
+            *g = match result {
+                Ok(found) => Discovery::Done(found),
+                Err(e) => Discovery::Failed(format!("{e:#}")),
+            };
+        });
     }
 
     fn start(&mut self) {
@@ -187,11 +231,25 @@ impl App {
             .show(ui, |ui| {
                 if self.settings.mode == Mode::Send {
                     ui.label("IP приёмника (Mac):");
-                    ui.add_enabled(
-                        !busy,
-                        egui::TextEdit::singleline(&mut self.settings.target_ip)
-                            .hint_text("192.168.1.44"),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(
+                            !busy,
+                            egui::TextEdit::singleline(&mut self.settings.target_ip)
+                                .desired_width(140.0)
+                                .hint_text("192.168.1.44"),
+                        );
+                        let searching = matches!(
+                            *self.discovery.lock().unwrap(),
+                            Discovery::Searching
+                        );
+                        if ui
+                            .add_enabled(!busy && !searching, egui::Button::new("🔍 Найти"))
+                            .on_hover_text("Найти Mac с запущенным приёмником (mDNS)")
+                            .clicked()
+                        {
+                            self.start_discovery();
+                        }
+                    });
                     ui.end_row();
                 } else {
                     ui.label("Джиттер-буфер:");
@@ -239,6 +297,61 @@ impl App {
                 });
                 ui.end_row();
             });
+    }
+
+    fn ui_discovery(&mut self, ui: &mut egui::Ui) {
+        if self.settings.mode != Mode::Send {
+            return;
+        }
+        let state = self.discovery.clone();
+        let mut clear = false;
+        match &*state.lock().unwrap() {
+            Discovery::Idle => {}
+            Discovery::Searching => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Ищу приёмники в сети…");
+                });
+                ui.ctx().request_repaint_after(Duration::from_millis(250));
+            }
+            Discovery::Done(found) if found.is_empty() => {
+                ui.label(
+                    egui::RichText::new(
+                        "Не найдено — убедитесь, что на Mac запущен приём",
+                    )
+                    .color(egui::Color32::GRAY),
+                );
+            }
+            Discovery::Done(found) => {
+                // Один найденный — сразу подставляем; несколько — по клику.
+                if found.len() == 1 {
+                    let f = &found[0];
+                    self.settings.target_ip = f.ip.to_string();
+                    self.settings.port = f.port;
+                    ui.label(format!("Найден: {} ({})", f.name, f.ip));
+                    clear = true;
+                } else {
+                    ui.label("Найдено несколько — выберите:");
+                    for f in found {
+                        if ui.link(format!("{} — {}:{}", f.name, f.ip, f.port)).clicked()
+                        {
+                            self.settings.target_ip = f.ip.to_string();
+                            self.settings.port = f.port;
+                            clear = true;
+                        }
+                    }
+                }
+            }
+            Discovery::Failed(e) => {
+                ui.label(
+                    egui::RichText::new(format!("Поиск не удался: {e}"))
+                        .color(egui::Color32::LIGHT_RED),
+                );
+            }
+        }
+        if clear {
+            *state.lock().unwrap() = Discovery::Idle;
+        }
     }
 
     fn ui_stats(&mut self, ui: &mut egui::Ui) {
@@ -339,6 +452,7 @@ impl eframe::App for App {
             ui.add_space(8.0);
 
             self.ui_settings(ui);
+            self.ui_discovery(ui);
             ui.add_space(12.0);
 
             let can_start = match self.settings.mode {
@@ -406,7 +520,11 @@ pub fn run() -> Result<()> {
     eframe::run_native(
         "SoundTransfer",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(|cc| {
+            #[cfg(target_os = "macos")]
+            set_dock_icon();
+            Ok(Box::new(App::new(cc)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("GUI: {e}"))
 }
