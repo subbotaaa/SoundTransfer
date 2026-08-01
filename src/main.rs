@@ -1,4 +1,9 @@
+// GUI-режим без консольного окна на Windows; для CLI-режимов
+// подключаемся к родительской консоли в main().
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod convert;
+mod gui;
 mod jitter;
 mod protocol;
 mod receiver;
@@ -25,8 +30,9 @@ use protocol::DEFAULT_PORT;
     about = "SoundTransfer — передача системного звука Windows → Mac по локальной сети"
 )]
 struct Cli {
+    /// Без подкоманды (двойной клик) открывается окно приложения.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -84,13 +90,29 @@ fn stop_flag() -> Arc<AtomicBool> {
     stop
 }
 
+/// В windows_subsystem="windows" консоли нет; для CLI-режимов
+/// подключаемся к консоли родительского процесса (терминала).
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_parent_console();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
     let cli = Cli::parse();
 
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        return gui::run();
+    };
+
+    match cmd {
         Cmd::Send {
             target,
             port,
@@ -111,6 +133,7 @@ fn main() -> Result<()> {
                 device,
             },
             stop_flag(),
+            std::sync::Arc::new(stats::ReceiverStats::default()),
         ),
         Cmd::ListDevices => list_devices(),
     }
@@ -155,6 +178,7 @@ fn run_send(
             device,
         },
         stop_flag(),
+        std::sync::Arc::new(stats::SenderStats::default()),
     )
 }
 

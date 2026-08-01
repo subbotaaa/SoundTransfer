@@ -16,7 +16,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use crate::capture;
 use crate::convert;
 use crate::protocol::{HEADER_LEN, Header, PacketType, WireFormat};
-use crate::stats::EverySecond;
+use crate::stats::{EverySecond, SenderStats, set_msg};
 
 pub struct SendOpts {
     pub target: SocketAddr,
@@ -100,6 +100,7 @@ fn send_packet(
     frames_per_packet: usize,
     pkts_sent: &mut u64,
     bytes_sent: &mut u64,
+    stats: &SenderStats,
 ) {
     header.ptype = PacketType::Audio;
     header.write(&mut pkt[..HEADER_LEN]);
@@ -111,6 +112,8 @@ fn send_packet(
         Ok(n) => {
             *pkts_sent += 1;
             *bytes_sent += n as u64;
+            stats.pkts.fetch_add(1, Ordering::Relaxed);
+            stats.bytes.fetch_add(n as u64, Ordering::Relaxed);
         }
         Err(e) => log::warn!("send: {e}"),
     }
@@ -118,18 +121,18 @@ fn send_packet(
     header.sample_pos += frames_per_packet as u64;
 }
 
-pub fn run(opts: SendOpts, stop: Arc<AtomicBool>) -> Result<()> {
+pub fn run(opts: SendOpts, stop: Arc<AtomicBool>, stats: Arc<SenderStats>) -> Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:0").context("bind UDP")?;
     sock.connect(opts.target)
         .with_context(|| format!("connect {}", opts.target))?;
 
-    // Кольцевой буфер ~500 мс — с запасом; сеть выгребает почти сразу.
+    // Кольцевой буфер ~2 с — с запасом; сеть выгребает почти сразу.
     let overflow = Arc::new(AtomicU64::new(0));
     let overflow_cb = overflow.clone();
 
     // Ёмкость посчитаем после того, как узнаем формат, поэтому захват
     // стартуем с буфером на максимальный разумный формат (48k/8ch хватит).
-    let rb = HeapRb::<f32>::new(48000 * 8 / 2); // 500 мс при 48к стерео × запас
+    let rb = HeapRb::<f32>::new(48000 * 4);
     let (mut prod, mut cons) = rb.split();
 
     let (stream, fmt) = capture::start_loopback(opts.device.as_deref(), move |chunk| {
@@ -145,6 +148,13 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>) -> Result<()> {
         opts.target,
         opts.wire_format,
         opts.frames_per_packet
+    );
+    set_msg(
+        &stats.status,
+        format!(
+            "{} Гц, {} кан » {}",
+            fmt.sample_rate, fmt.channels, opts.target
+        ),
     );
 
     let channels = fmt.channels as usize;
@@ -203,6 +213,7 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>) -> Result<()> {
                 opts.frames_per_packet,
                 &mut pkts_sent,
                 &mut bytes_sent,
+                &stats,
             );
         } else if last_real_data.elapsed() >= idle_threshold {
             // Захват простаивает — шлём тишину в темпе реального времени.
@@ -218,6 +229,7 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>) -> Result<()> {
                     opts.frames_per_packet,
                     &mut pkts_sent,
                     &mut bytes_sent,
+                    &stats,
                 );
                 synth_deadline = Some(deadline + packet_dur);
             } else {
@@ -228,6 +240,9 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>) -> Result<()> {
         }
 
         if ticker.tick() {
+            stats
+                .ring_overflow
+                .store(overflow.load(Ordering::Relaxed), Ordering::Relaxed);
             log::info!(
                 "tx: {} пак/с, {:.1} кбит/с, ring {} мс, переполнений {}",
                 pkts_sent,

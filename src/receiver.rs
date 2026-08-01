@@ -14,7 +14,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use crate::convert;
 use crate::jitter::{DriftComp, SeqTracker, Slip, Verdict};
 use crate::protocol::{HEADER_LEN, Header, PacketType, WireFormat};
-use crate::stats::EverySecond;
+use crate::stats::{EverySecond, ReceiverStats, set_msg};
 
 pub struct RecvOpts {
     pub port: u16,
@@ -36,7 +36,7 @@ const MAX_GAP_MS: u64 = 500;
 /// Порог среза переполнения: target + 40 мс.
 const CUT_OVER_TARGET_MS: u32 = 40;
 
-pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>) -> Result<()> {
+pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", opts.port))
         .with_context(|| format!("bind UDP :{}", opts.port))?;
     sock.set_read_timeout(Some(Duration::from_millis(100)))?;
@@ -69,6 +69,13 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>) -> Result<()> {
         first.sample_rate,
         first.channels,
         first.format
+    );
+    set_msg(
+        &stats.status,
+        format!(
+            "{} » {} Гц, {} кан",
+            peer, first.sample_rate, first.channels
+        ),
     );
 
     let sample_rate = first.sample_rate;
@@ -199,6 +206,8 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>) -> Result<()> {
                     PacketType::Audio => {
                         pkts += 1;
                         bytes += n as u64;
+                        stats.pkts.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes.fetch_add(n as u64, Ordering::Relaxed);
                         let payload = &buf[HEADER_LEN..n];
                         let frames_in =
                             payload.len() / h.format.bytes_per_sample() / channels;
@@ -257,6 +266,22 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>) -> Result<()> {
         if ticker.tick() {
             let fill_ms =
                 prod.occupied_len() / channels * 1000 / sample_rate as usize;
+            stats.fill_ms.store(fill_ms as u64, Ordering::Relaxed);
+            stats.lost.store(tracker.lost_packets, Ordering::Relaxed);
+            stats.late.store(tracker.late_packets, Ordering::Relaxed);
+            stats
+                .underruns
+                .store(shared.underruns.load(Ordering::Relaxed), Ordering::Relaxed);
+            stats
+                .cuts
+                .store(shared.cuts.load(Ordering::Relaxed), Ordering::Relaxed);
+            stats
+                .slip_dropped
+                .store(drift.dropped_frames, Ordering::Relaxed);
+            stats
+                .slip_duplicated
+                .store(drift.duplicated_frames, Ordering::Relaxed);
+            stats.ring_overflow.store(ring_overflow, Ordering::Relaxed);
             log::info!(
                 "rx: {} пак/с, {:.1} кбит/с | буфер {} мс (EMA {:.1} мс) | потеряно {}, поздних {}, underruns {}, срезов {}, slip -{}/+{}, ring overflow {}",
                 pkts,
