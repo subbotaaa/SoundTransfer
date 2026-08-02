@@ -11,7 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use eframe::egui;
 
 use crate::discovery;
-use crate::protocol::{DEFAULT_PORT, WireFormat};
+use crate::protocol::DEFAULT_PORT;
 use crate::receiver;
 use crate::stats::{RateMeter, ReceiverStats, SenderStats, get_msg, set_msg};
 
@@ -19,7 +19,7 @@ use crate::stats::{RateMeter, ReceiverStats, SenderStats, get_msg, set_msg};
 /// выставляем её программно — работает и при запуске бинарника напрямую.
 #[cfg(target_os = "macos")]
 fn set_dock_icon() {
-    use objc2::MainThreadMarker;
+    use objc2::{AnyThread, MainThreadMarker};
     use objc2_app_kit::{NSApplication, NSImage};
     use objc2_foundation::NSData;
 
@@ -172,7 +172,7 @@ impl App {
                     let opts = crate::sender::SendOpts {
                         target: addr,
                         frames_per_packet: 128,
-                        wire_format: WireFormat::S16le,
+                        wire_format: crate::protocol::WireFormat::S16le,
                         device,
                     };
                     let s2 = stats.clone();
