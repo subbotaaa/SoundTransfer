@@ -24,6 +24,7 @@ log = "0.4.33"
 mdns-sd = "0.20.3"
 ringbuf = "0.5.1"
 serde = { version = "1.0.229", features = ["derive"] }
+tray-icon = "0.24.2"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }

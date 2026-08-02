@@ -44,6 +44,96 @@ enum Discovery {
     Failed(String),
 }
 
+/// Иконка в системном трее (Windows) / строке меню (macOS) с меню
+/// Показать / Запустить / Остановить / Выход. Команды меню идут через
+/// тот же канал, что и Home Assistant (`ControlState::pending`), а
+/// показ/закрытие окна — через `TrayCmd`.
+struct TrayCmd {
+    show_window: std::sync::atomic::AtomicBool,
+    quit: std::sync::atomic::AtomicBool,
+}
+
+fn setup_tray(
+    ctx: &egui::Context,
+    control: &Arc<ControlState>,
+) -> (Option<tray_icon::TrayIcon>, Arc<TrayCmd>) {
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::{TrayIconBuilder, TrayIconEvent};
+
+    let cmd = Arc::new(TrayCmd {
+        show_window: std::sync::atomic::AtomicBool::new(false),
+        quit: std::sync::atomic::AtomicBool::new(false),
+    });
+
+    let menu = Menu::new();
+    let build = menu.append_items(&[
+        &MenuItem::with_id("show", "Показать окно", true, None),
+        &PredefinedMenuItem::separator(),
+        &MenuItem::with_id("start", "Запустить", true, None),
+        &MenuItem::with_id("stop", "Остановить", true, None),
+        &PredefinedMenuItem::separator(),
+        &MenuItem::with_id("quit", "Выход", true, None),
+    ]);
+    if let Err(e) = build {
+        log::warn!("трей: не удалось создать меню: {e}");
+        return (None, cmd);
+    }
+
+    {
+        let ctx = ctx.clone();
+        let control = control.clone();
+        let cmd = cmd.clone();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            match event.id.as_ref() {
+                "show" => cmd.show_window.store(true, Ordering::Relaxed),
+                "start" => *control.pending.lock().unwrap() = Some(true),
+                "stop" => *control.pending.lock().unwrap() = Some(false),
+                "quit" => cmd.quit.store(true, Ordering::Relaxed),
+                _ => {}
+            }
+            ctx.request_repaint();
+        }));
+    }
+    {
+        // Клик левой кнопкой по иконке — показать окно (Windows;
+        // на macOS левый клик открывает меню).
+        let ctx = ctx.clone();
+        let cmd = cmd.clone();
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            if let TrayIconEvent::Click {
+                button: tray_icon::MouseButton::Left,
+                button_state: tray_icon::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                cmd.show_window.store(true, Ordering::Relaxed);
+                ctx.request_repaint();
+            }
+        }));
+    }
+
+    let rgba = include_bytes!("../assets/icon32.rgba").to_vec();
+    let icon = match tray_icon::Icon::from_rgba(rgba, 32, 32) {
+        Ok(i) => i,
+        Err(e) => {
+            log::warn!("трей: иконка не собралась: {e}");
+            return (None, cmd);
+        }
+    };
+    match TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("SoundTransfer")
+        .with_icon(icon)
+        .build()
+    {
+        Ok(tray) => (Some(tray), cmd),
+        Err(e) => {
+            log::warn!("трей недоступен: {e}");
+            (None, cmd)
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Mode {
     Send,
@@ -115,6 +205,8 @@ pub struct App {
     last_error: Option<String>,
     discovery: Arc<std::sync::Mutex<Discovery>>,
     control: Arc<ControlState>,
+    _tray: Option<tray_icon::TrayIcon>,
+    tray_cmd: Arc<TrayCmd>,
 }
 
 impl App {
@@ -128,6 +220,8 @@ impl App {
         *control.repaint.lock().unwrap() = Some(cc.egui_ctx.clone());
         crate::control::spawn(CONTROL_PORT, control.clone());
 
+        let (tray, tray_cmd) = setup_tray(&cc.egui_ctx, &control);
+
         Self {
             settings,
             running: None,
@@ -137,6 +231,8 @@ impl App {
             last_error: None,
             discovery: Arc::new(std::sync::Mutex::new(Discovery::Idle)),
             control,
+            _tray: tray,
+            tray_cmd,
         }
     }
 
@@ -454,12 +550,32 @@ impl eframe::App for App {
             self.stop();
         }
 
-        // Команды из Home Assistant (HTTP /start, /stop).
+        // Команды из Home Assistant (HTTP /start, /stop) и меню трея.
         let pending = self.control.pending.lock().unwrap().take();
         match pending {
             Some(true) if self.running.is_none() => self.start(),
             Some(false) if self.running.is_some() => self.stop(),
             _ => {}
+        }
+
+        // Команды трея: показать окно / выйти.
+        if self.tray_cmd.show_window.swap(false, Ordering::Relaxed) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        let quitting = self.tray_cmd.quit.load(Ordering::Relaxed);
+        if quitting {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Кнопка закрытия окна прячет в трей (если трей есть);
+        // по-настоящему выходим только через «Выход» в меню трея.
+        if ui.ctx().input(|i| i.viewport().close_requested())
+            && !quitting
+            && self._tray.is_some()
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         {
