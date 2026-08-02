@@ -37,6 +37,58 @@ fn set_dock_icon() {
     }
 }
 
+/// Пока окно скрыто в трее, приложение не должно занимать место в Dock
+/// и в переключателе Cmd-Tab: policy Accessory убирает его оттуда,
+/// Regular — возвращает при показе окна.
+#[cfg(target_os = "macos")]
+fn set_dock_visible(visible: bool) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let policy = if visible {
+        NSApplicationActivationPolicy::Regular
+    } else {
+        NSApplicationActivationPolicy::Accessory
+    };
+    app.setActivationPolicy(policy);
+    if visible {
+        // После Accessory окно само не выходит на передний план.
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_visible(_visible: bool) {}
+
+/// Показ окна из трея на macOS. Пока окно скрыто (orderOut) и приложение
+/// в режиме Accessory, egui-цикл может не проснуться на request_repaint,
+/// поэтому окно выводим нативно и синхронно — обработчик меню трея
+/// выполняется в главном потоке.
+#[cfg(target_os = "macos")]
+fn macos_show_from_tray() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    set_dock_visible(true);
+    let app = NSApplication::sharedApplication(mtm);
+    for win in app.windows().iter() {
+        win.makeKeyAndOrderFront(None);
+    }
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_show_from_tray() {}
+
 enum Discovery {
     Idle,
     Searching,
@@ -85,7 +137,10 @@ fn setup_tray(
         let cmd = cmd.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             match event.id.as_ref() {
-                "show" => cmd.show_window.store(true, Ordering::Relaxed),
+                "show" => {
+                    macos_show_from_tray();
+                    cmd.show_window.store(true, Ordering::Relaxed);
+                }
                 "start" => *control.pending.lock().unwrap() = Some(true),
                 "stop" => *control.pending.lock().unwrap() = Some(false),
                 "quit" => cmd.quit.store(true, Ordering::Relaxed),
@@ -106,6 +161,7 @@ fn setup_tray(
                 ..
             } = event
             {
+                macos_show_from_tray();
                 cmd.show_window.store(true, Ordering::Relaxed);
                 ctx.request_repaint();
             }
@@ -558,6 +614,7 @@ impl eframe::App for App {
                 if self._tray.is_some() {
                     ui.ctx()
                         .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    set_dock_visible(false);
                 }
             } else {
                 ui.ctx().request_repaint_after(deadline - now);
@@ -579,6 +636,7 @@ impl eframe::App for App {
 
         // Команды трея: показать окно / выйти.
         if self.tray_cmd.show_window.swap(false, Ordering::Relaxed) {
+            set_dock_visible(true);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
         }
@@ -595,6 +653,7 @@ impl eframe::App for App {
         {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            set_dock_visible(false);
         }
 
         {
