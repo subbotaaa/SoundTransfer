@@ -9,6 +9,8 @@ cd "$(dirname "$0")"
 
 cargo build --release
 
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
 APP=SoundTransfer.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -25,7 +27,7 @@ if [ -f assets/icon.png ]; then
   iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/icon.icns"
 fi
 
-cat > "$APP/Contents/Info.plist" <<'EOF'
+cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -33,8 +35,8 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
   <key>CFBundleName</key><string>SoundTransfer</string>
   <key>CFBundleDisplayName</key><string>SoundTransfer</string>
   <key>CFBundleIdentifier</key><string>local.soundtransfer</string>
-  <key>CFBundleVersion</key><string>0.1.0</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>st</string>
   <key>CFBundleIconFile</key><string>icon</string>
@@ -44,6 +46,11 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 EOF
 
 cp target/release/st "$APP/Contents/MacOS/st"
+
+# Ad-hoc подпись всего бандла. Без неё Gatekeeper показывает скачанному из
+# интернета приложению «повреждено, переместите в Корзину» без кнопки
+# «Открыть» — подписанный бандл даёт обычное предупреждение с обходом.
+codesign --force --deep --sign - "$APP"
 
 echo "Готово: $(pwd)/$APP"
 
