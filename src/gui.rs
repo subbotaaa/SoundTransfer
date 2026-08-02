@@ -10,6 +10,7 @@ use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
 use eframe::egui;
 
+use crate::control::{CONTROL_PORT, ControlState};
 use crate::discovery;
 use crate::protocol::DEFAULT_PORT;
 use crate::receiver;
@@ -113,6 +114,7 @@ pub struct App {
     byte_rate: RateMeter,
     last_error: Option<String>,
     discovery: Arc<std::sync::Mutex<Discovery>>,
+    control: Arc<ControlState>,
 }
 
 impl App {
@@ -121,6 +123,11 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value::<Settings>(s, eframe::APP_KEY))
             .unwrap_or_default();
+        // HTTP-управление для Home Assistant: /start /stop /status.
+        let control = ControlState::new();
+        *control.repaint.lock().unwrap() = Some(cc.egui_ctx.clone());
+        crate::control::spawn(CONTROL_PORT, control.clone());
+
         Self {
             settings,
             running: None,
@@ -129,6 +136,7 @@ impl App {
             byte_rate: RateMeter::new(),
             last_error: None,
             discovery: Arc::new(std::sync::Mutex::new(Discovery::Idle)),
+            control,
         }
     }
 
@@ -159,6 +167,23 @@ impl App {
             Mode::Send => {
                 #[cfg(windows)]
                 {
+                    // Пустой IP (напр., старт из Home Assistant на чистых
+                    // настройках) — ищем приёмник в сети сами.
+                    if self.settings.target_ip.trim().is_empty() {
+                        match discovery::discover(Duration::from_secs(3)) {
+                            Ok(found) if !found.is_empty() => {
+                                self.settings.target_ip = found[0].ip.to_string();
+                                self.settings.port = found[0].port;
+                            }
+                            _ => {
+                                self.last_error = Some(
+                                    "Приёмник не найден — запустите приём на Mac или укажите IP"
+                                        .to_string(),
+                                );
+                                return;
+                            }
+                        }
+                    }
                     let stats = Arc::new(SenderStats::default());
                     let target = format!("{}:{}", self.settings.target_ip.trim(), self.settings.port);
                     use std::net::ToSocketAddrs;
@@ -183,6 +208,9 @@ impl App {
                         }
                     });
                     self.running = Some(Running::Send { stop, join, stats });
+                    self.control.running.store(true, Ordering::Relaxed);
+                    *self.control.info.lock().unwrap() =
+                        format!("send:{}", self.settings.target_ip.trim());
                 }
                 #[cfg(not(windows))]
                 {
@@ -205,6 +233,8 @@ impl App {
                     }
                 });
                 self.running = Some(Running::Recv { stop, join, stats });
+                self.control.running.store(true, Ordering::Relaxed);
+                *self.control.info.lock().unwrap() = "recv".to_string();
             }
         }
     }
@@ -219,6 +249,8 @@ impl App {
                 }
             }
         }
+        self.control.running.store(false, Ordering::Relaxed);
+        self.control.info.lock().unwrap().clear();
         self.pkt_rate.reset();
         self.byte_rate.reset();
     }
@@ -420,6 +452,14 @@ impl eframe::App for App {
         // Рабочий поток мог завершиться сам (ошибка) — забираем состояние.
         if self.running.as_ref().is_some_and(|r| r.is_finished()) {
             self.stop();
+        }
+
+        // Команды из Home Assistant (HTTP /start, /stop).
+        let pending = self.control.pending.lock().unwrap().take();
+        match pending {
+            Some(true) if self.running.is_none() => self.start(),
+            Some(false) if self.running.is_some() => self.stop(),
+            _ => {}
         }
 
         {

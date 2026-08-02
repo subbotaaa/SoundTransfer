@@ -1,0 +1,48 @@
+# SoundTransfer — переключатель для Home Assistant.
+#
+# Добавьте содержимое в configuration.yaml (или разнесите по своим
+# packages/включаемым файлам) и перезапустите HA.
+#
+# IP-адреса:
+#   Windows ПК: 192.168.1.133 (порт управления 48101)
+#   MacBook:    192.168.1.44  (порт управления 48101)
+# Приложение SoundTransfer должно быть запущено на обеих машинах
+# (автозапуск при входе в систему) — переключатель лишь включает и
+# выключает передачу звука.
+
+rest_command:
+  soundtransfer_win_start:
+    url: "http://192.168.1.133:48101/start"
+    method: post
+  soundtransfer_win_stop:
+    url: "http://192.168.1.133:48101/stop"
+    method: post
+  soundtransfer_mac_start:
+    url: "http://192.168.1.44:48101/start"
+    method: post
+  soundtransfer_mac_stop:
+    url: "http://192.168.1.44:48101/stop"
+    method: post
+
+binary_sensor:
+  - platform: rest
+    name: soundtransfer_active
+    resource: "http://192.168.1.133:48101/status"
+    value_template: "{{ value_json.running }}"
+    scan_interval: 10
+
+switch:
+  - platform: template
+    switches:
+      soundtransfer:
+        friendly_name: "Звук ПК → Mac"
+        value_template: "{{ is_state('binary_sensor.soundtransfer_active', 'on') }}"
+        turn_on:
+          # Сначала приём на Mac, затем отправка с ПК.
+          - service: rest_command.soundtransfer_mac_start
+          - delay:
+              seconds: 2
+          - service: rest_command.soundtransfer_win_start
+        turn_off:
+          - service: rest_command.soundtransfer_win_stop
+          - service: rest_command.soundtransfer_mac_stop

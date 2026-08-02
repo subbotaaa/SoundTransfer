@@ -2,6 +2,7 @@
 // подключаемся к родительской консоли в main().
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod control;
 mod convert;
 mod discovery;
 mod gui;
