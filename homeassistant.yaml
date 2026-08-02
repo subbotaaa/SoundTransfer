@@ -1,14 +1,10 @@
-# SoundTransfer — переключатель для Home Assistant.
-#
-# Добавьте содержимое в configuration.yaml (или разнесите по своим
-# packages/включаемым файлам) и перезапустите HA.
+# SoundTransfer — переключатель для Home Assistant (современный формат template).
 #
 # IP-адреса:
 #   Windows ПК: 192.168.1.133 (порт управления 48101)
 #   MacBook:    192.168.1.44  (порт управления 48101)
 # Приложение SoundTransfer должно быть запущено на обеих машинах
-# (автозапуск при входе в систему) — переключатель лишь включает и
-# выключает передачу звука.
+# (автозапуск при входе) — переключатель включает/выключает передачу.
 
 rest_command:
   soundtransfer_win_start:
@@ -24,25 +20,25 @@ rest_command:
     url: "http://192.168.1.44:48101/stop"
     method: post
 
-binary_sensor:
-  - platform: rest
-    name: soundtransfer_active
-    resource: "http://192.168.1.133:48101/status"
-    value_template: "{{ value_json.running }}"
+rest:
+  - resource: "http://192.168.1.133:48101/status"
     scan_interval: 10
+    binary_sensor:
+      - name: soundtransfer_active
+        unique_id: soundtransfer_active
+        value_template: "{{ value_json.running }}"
 
-switch:
-  - platform: template
-    switches:
-      soundtransfer:
-        friendly_name: "Звук ПК → Mac"
-        value_template: "{{ is_state('binary_sensor.soundtransfer_active', 'on') }}"
+template:
+  - switch:
+      - name: "Звук ПК → Mac"
+        unique_id: soundtransfer
+        state: "{{ is_state('binary_sensor.soundtransfer_active', 'on') }}"
         turn_on:
-          # Сначала приём на Mac, затем отправка с ПК.
-          - service: rest_command.soundtransfer_mac_start
+          # Сначала приём на Mac, затем отправка с ПК
+          - action: rest_command.soundtransfer_mac_start
           - delay:
               seconds: 2
-          - service: rest_command.soundtransfer_win_start
+          - action: rest_command.soundtransfer_win_start
         turn_off:
-          - service: rest_command.soundtransfer_win_stop
-          - service: rest_command.soundtransfer_mac_stop
+          - action: rest_command.soundtransfer_win_stop
+          - action: rest_command.soundtransfer_mac_stop
