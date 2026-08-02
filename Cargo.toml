@@ -1,0 +1,36 @@
+[package]
+name = "st"
+version = "0.2.0"
+edition = "2024"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder", "NSRunningApplication", "NSWindow"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSArray"] }
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.5", features = ["derive"] }
+cpal = "0.18.1"
+ctrlc = "3.5.2"
+eframe = { version = "0.35.0", features = ["persistence"] }
+env_logger = "0.11.11"
+gethostname = "1.1.0"
+log = "0.4.33"
+mdns-sd = "0.20.3"
+ringbuf = "0.5.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tray-icon = "0.24.2"
+ureq = "3.3.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+
+[build-dependencies]
+winresource = "0.1.31"
