@@ -35,6 +35,11 @@ struct Cli {
     /// Без подкоманды (двойной клик) открывается окно приложения.
     #[command(subcommand)]
     cmd: Option<Cmd>,
+
+    /// Запустить GUI со скрытым окном (только иконка в трее/строке меню) —
+    /// для автозапуска при входе в систему
+    #[arg(long)]
+    hidden: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -111,7 +116,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let Some(cmd) = cli.cmd else {
-        return gui::run();
+        return gui::run(cli.hidden);
     };
 
     match cmd {

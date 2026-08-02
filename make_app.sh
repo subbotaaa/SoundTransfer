@@ -1,6 +1,9 @@
 #!/bin/sh
 # Собирает SoundTransfer.app для macOS из release-бинарника.
-# Запуск на Mac:  sh make_app.sh
+#   sh make_app.sh              — только собрать .app
+#   sh make_app.sh --autostart  — собрать, положить в /Applications и
+#                                 настроить автозапуск при входе со
+#                                 скрытым окном (только строка меню)
 set -e
 cd "$(dirname "$0")"
 
@@ -43,4 +46,38 @@ EOF
 cp target/release/st "$APP/Contents/MacOS/st"
 
 echo "Готово: $(pwd)/$APP"
-echo "Перетащите SoundTransfer.app в «Программы» (Applications) — и запускайте как обычное приложение."
+
+if [ "$1" = "--autostart" ]; then
+  echo "Устанавливаю в /Applications и настраиваю автозапуск…"
+  rm -rf /Applications/SoundTransfer.app
+  cp -R "$APP" /Applications/SoundTransfer.app
+
+  PLIST="$HOME/Library/LaunchAgents/local.soundtransfer.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.soundtransfer</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/SoundTransfer.app/Contents/MacOS/st</string>
+    <string>--hidden</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+EOF
+  # Перезагружаем агент (bootstrap — современный способ, load — запасной)
+  launchctl bootout "gui/$(id -u)/local.soundtransfer" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || launchctl load "$PLIST"
+
+  echo "Автозапуск настроен: при входе в систему приложение стартует"
+  echo "скрытым — только иконка в строке меню. Если раньше добавляли"
+  echo "SoundTransfer в «Объекты входа» — удалите его там, чтобы не"
+  echo "запускалось дважды."
+else
+  echo "Перетащите SoundTransfer.app в «Программы» (Applications) — и запускайте как обычное приложение."
+  echo "Для автозапуска в скрытом виде: sh make_app.sh --autostart"
+fi

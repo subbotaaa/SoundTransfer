@@ -207,10 +207,14 @@ pub struct App {
     control: Arc<ControlState>,
     _tray: Option<tray_icon::TrayIcon>,
     tray_cmd: Arc<TrayCmd>,
+    /// --hidden: спрятать окно вскоре после старта. eframe 0.35 сам
+    /// показывает окно после первого кадра, игнорируя with_visible(false),
+    /// поэтому прячем с небольшой задержкой, когда его логика уже отработала.
+    hide_deadline: Option<std::time::Instant>,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, hidden: bool) -> Self {
         let settings = cc
             .storage
             .and_then(|s| eframe::get_value::<Settings>(s, eframe::APP_KEY))
@@ -233,6 +237,8 @@ impl App {
             control,
             _tray: tray,
             tray_cmd,
+            hide_deadline: hidden
+                .then(|| std::time::Instant::now() + Duration::from_millis(150)),
         }
     }
 
@@ -545,6 +551,19 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(deadline) = self.hide_deadline {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                self.hide_deadline = None;
+                if self._tray.is_some() {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+            } else {
+                ui.ctx().request_repaint_after(deadline - now);
+            }
+        }
+
         // Рабочий поток мог завершиться сам (ошибка) — забираем состояние.
         if self.running.as_ref().is_some_and(|r| r.is_finished()) {
             self.stop();
@@ -666,20 +685,22 @@ fn list_output_devices() -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn run() -> Result<()> {
+pub fn run(hidden: bool) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 400.0])
-            .with_min_inner_size([380.0, 320.0]),
+            .with_min_inner_size([380.0, 320.0])
+            // --hidden: старт сразу в трее, окно покажется по клику.
+            .with_visible(!hidden),
         ..Default::default()
     };
     eframe::run_native(
         "SoundTransfer",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             #[cfg(target_os = "macos")]
             set_dock_icon();
-            Ok(Box::new(App::new(cc)))
+            Ok(Box::new(App::new(cc, hidden)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI: {e}"))
