@@ -98,6 +98,7 @@ enum Discovery {
 
 enum UpdateState {
     Unknown,
+    Checking,
     UpToDate,
     Available(crate::update::Latest),
     Installing,
@@ -282,6 +283,7 @@ pub struct App {
     /// Громкость приёмника — общая с потоком приёма (live).
     volume: Arc<std::sync::atomic::AtomicU32>,
     update: Arc<std::sync::Mutex<UpdateState>>,
+    egui_ctx: egui::Context,
     /// Сглаженный уровень для VU-метра.
     vu_level: f32,
     /// --hidden: спрятать окно вскоре после старта. eframe 0.35 сам
@@ -318,19 +320,7 @@ impl App {
             std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(Duration::from_secs(3));
-                    let state = match crate::update::check() {
-                        Ok(Some(latest)) => UpdateState::Available(latest),
-                        Ok(None) => UpdateState::UpToDate,
-                        Err(e) => {
-                            log::warn!("проверка обновлений: {e:#}");
-                            UpdateState::Unknown
-                        }
-                    };
-                    let found = matches!(state, UpdateState::Available(_));
-                    *update.lock().unwrap() = state;
-                    if found {
-                        ctx.request_repaint();
-                    }
+                    run_update_check(&update, &ctx);
                     std::thread::sleep(Duration::from_secs(6 * 3600));
                 }
             });
@@ -349,6 +339,7 @@ impl App {
             tray_cmd,
             volume,
             update,
+            egui_ctx: cc.egui_ctx.clone(),
             vu_level: 0.0,
             hide_deadline: hidden
                 .then(|| std::time::Instant::now() + Duration::from_millis(150)),
@@ -589,42 +580,81 @@ impl App {
         });
     }
 
+    /// Ручная проверка обновлений (кнопка «Проверить»).
+    fn start_check(&mut self) {
+        {
+            let mut g = self.update.lock().unwrap();
+            if matches!(*g, UpdateState::Checking | UpdateState::Installing) {
+                return;
+            }
+            *g = UpdateState::Checking;
+        }
+        let update = self.update.clone();
+        let ctx = self.egui_ctx.clone();
+        std::thread::spawn(move || run_update_check(&update, &ctx));
+    }
+
     fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
         let mut install = false;
+        let mut check = false;
         {
             let g = self.update.lock().unwrap();
-            match &*g {
+            ui.horizontal(|ui| match &*g {
                 UpdateState::Available(l) => {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("⬆ Доступна версия {}", l.version))
-                                .color(egui::Color32::from_rgb(230, 190, 60)),
-                        );
-                        if ui.button("Обновить").clicked() {
-                            install = true;
-                        }
-                    });
-                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("⬆ Доступна версия {}", l.version))
+                            .color(egui::Color32::from_rgb(230, 190, 60)),
+                    );
+                    if ui.button("Обновить").clicked() {
+                        install = true;
+                    }
                 }
                 UpdateState::Installing => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Скачиваю и устанавливаю обновление…");
-                    });
-                    ui.add_space(4.0);
+                    ui.spinner();
+                    ui.label("Скачиваю и устанавливаю обновление…");
+                }
+                UpdateState::Checking => {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("Проверяю обновления…")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+                UpdateState::UpToDate => {
+                    ui.label(
+                        egui::RichText::new("✔ У вас последняя версия")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                    if ui.small_button("Проверить обновления").clicked() {
+                        check = true;
+                    }
+                }
+                UpdateState::Unknown => {
+                    if ui.small_button("Проверить обновления").clicked() {
+                        check = true;
+                    }
                 }
                 UpdateState::Failed(e) => {
                     ui.label(
-                        egui::RichText::new(format!("Обновление не удалось: {e}"))
+                        egui::RichText::new(format!("Проверка не удалась: {e}"))
+                            .small()
                             .color(egui::Color32::LIGHT_RED),
-                    );
-                    ui.add_space(4.0);
+                    )
+                    .on_hover_text(e);
+                    if ui.small_button("Повторить").clicked() {
+                        check = true;
+                    }
                 }
-                _ => {}
-            }
+            });
+            ui.add_space(4.0);
         }
         if install {
             self.trigger_install();
+        }
+        if check {
+            self.start_check();
         }
     }
 
@@ -814,6 +844,11 @@ impl eframe::App for App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading("SoundTransfer");
+                ui.label(
+                    egui::RichText::new(format!("v{}", crate::update::current_version()))
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new("Windows » Mac по локальной сети")
@@ -888,6 +923,26 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         self.stop();
     }
+}
+
+/// Выполняет проверку обновлений и кладёт результат в состояние.
+/// Не трогает состояния Installing/Checking-гонки — вызывающий сам ставит Checking.
+fn run_update_check(update: &Arc<std::sync::Mutex<UpdateState>>, ctx: &egui::Context) {
+    let state = match crate::update::check() {
+        Ok(Some(latest)) => UpdateState::Available(latest),
+        Ok(None) => UpdateState::UpToDate,
+        Err(e) => {
+            log::warn!("проверка обновлений: {e:#}");
+            UpdateState::Failed(format!("{e:#}"))
+        }
+    };
+    let mut g = update.lock().unwrap();
+    // Не затираем установку, если она началась, пока мы проверяли.
+    if !matches!(*g, UpdateState::Installing) {
+        *g = state;
+    }
+    drop(g);
+    ctx.request_repaint();
 }
 
 /// Полоска уровня сигнала: -60..0 дБ → 0..1 ширины, зелёный/жёлтый/красный.
