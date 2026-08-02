@@ -1,27 +1,27 @@
 # SoundTransfer — переключатель для Home Assistant (современный формат template).
 #
-# IP-адреса:
-#   Windows ПК: 192.168.1.133 (порт управления 48101)
-#   MacBook:    192.168.1.44  (порт управления 48101)
-# Приложение SoundTransfer должно быть запущено на обеих машинах
-# (автозапуск при входе) — переключатель включает/выключает передачу.
+# Замените IP на свои:
+#   WIN_IP — Windows ПК (отправитель), MAC_IP — Mac (приёмник).
+# Порт управления по умолчанию 48101. Приложение SoundTransfer должно быть
+# запущено на обеих машинах (автозапуск при входе) — переключатель
+# включает/выключает передачу.
 
 rest_command:
   soundtransfer_win_start:
-    url: "http://192.168.1.133:48101/start"
+    url: "http://WIN_IP:48101/start"
     method: post
   soundtransfer_win_stop:
-    url: "http://192.168.1.133:48101/stop"
+    url: "http://WIN_IP:48101/stop"
     method: post
   soundtransfer_mac_start:
-    url: "http://192.168.1.44:48101/start"
+    url: "http://MAC_IP:48101/start"
     method: post
   soundtransfer_mac_stop:
-    url: "http://192.168.1.44:48101/stop"
+    url: "http://MAC_IP:48101/stop"
     method: post
 
 rest:
-  - resource: "http://192.168.1.133:48101/status"
+  - resource: "http://WIN_IP:48101/status"
     scan_interval: 10
     binary_sensor:
       - name: soundtransfer_active

@@ -28,13 +28,24 @@ impl EverySecond {
     }
 }
 
+/// Атомарное хранение f32 (для уровней/громкости между потоками).
+pub fn store_f32(slot: &std::sync::atomic::AtomicU32, v: f32) {
+    slot.store(v.to_bits(), Ordering::Relaxed);
+}
+
+pub fn load_f32(slot: &std::sync::atomic::AtomicU32) -> f32 {
+    f32::from_bits(slot.load(Ordering::Relaxed))
+}
+
 /// Накопительные счётчики отправителя (GUI считает скорости по дельтам).
 #[derive(Default)]
 pub struct SenderStats {
     pub pkts: AtomicU64,
     pub bytes: AtomicU64,
     pub ring_overflow: AtomicU64,
-    /// Строка состояния («48000 Гц, 2 кан → 192.168.1.44:48100»).
+    /// Пиковый уровень последнего пакета, 0..1 (f32 в битах).
+    pub level: std::sync::atomic::AtomicU32,
+    /// Строка состояния («48000 Гц, 2 кан » IP:порт»).
     pub status: Mutex<Option<String>>,
     /// Ошибка, завершившая работу (для показа в GUI).
     pub error: Mutex<Option<String>>,
@@ -45,6 +56,8 @@ pub struct SenderStats {
 pub struct ReceiverStats {
     pub pkts: AtomicU64,
     pub bytes: AtomicU64,
+    /// Пиковый уровень последнего пакета (после громкости), 0..1.
+    pub level: std::sync::atomic::AtomicU32,
     /// Текущая заполненность буфера, мс.
     pub fill_ms: AtomicU64,
     pub lost: AtomicU64,

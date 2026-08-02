@@ -20,6 +20,8 @@ pub struct RecvOpts {
     pub port: u16,
     pub buffer_ms: u32,
     pub device: Option<String>,
+    /// Громкость 0..~1.5 (f32 в битах) — можно менять на лету.
+    pub volume: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Общие атомики между сетевым потоком и аудио-callback'ом.
@@ -246,6 +248,21 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> 
                             WireFormat::S16le => convert::s16le_to_f32(payload, &mut decoded),
                             WireFormat::F32le => convert::f32le_to_f32(payload, &mut decoded),
                         }
+
+                        // Громкость (live) + защита от клиппинга; заодно peak.
+                        let vol = crate::stats::load_f32(&opts.volume);
+                        let mut peak = 0f32;
+                        if (vol - 1.0).abs() > 1e-3 {
+                            for s in decoded.iter_mut() {
+                                *s = (*s * vol).clamp(-1.0, 1.0);
+                                peak = peak.max(s.abs());
+                            }
+                        } else {
+                            for s in decoded.iter() {
+                                peak = peak.max(s.abs());
+                            }
+                        }
+                        crate::stats::store_f32(&stats.level, peak);
 
                         // Компенсация дрейфа: изредка минус/плюс один фрейм.
                         let fill_frames = prod.occupied_len() / channels;

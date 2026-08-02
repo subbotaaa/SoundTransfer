@@ -6,6 +6,7 @@ mod control;
 mod convert;
 mod discovery;
 mod gui;
+mod update;
 mod jitter;
 mod protocol;
 mod receiver;
@@ -83,6 +84,9 @@ enum Cmd {
         /// Подстрока имени устройства вывода (по умолчанию — дефолтное)
         #[arg(long)]
         device: Option<String>,
+        /// Громкость в процентах (0..150)
+        #[arg(long, default_value_t = 100)]
+        volume: u16,
     },
     /// Показать устройства вывода
     ListDevices,
@@ -116,6 +120,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let Some(cmd) = cli.cmd else {
+        update::cleanup_leftovers();
         return gui::run(cli.hidden);
     };
 
@@ -133,11 +138,15 @@ fn main() -> Result<()> {
             port,
             buffer_ms,
             device,
+            volume,
         } => receiver::run(
             receiver::RecvOpts {
                 port,
                 buffer_ms,
                 device,
+                volume: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                    (volume.min(150) as f32 / 100.0).to_bits(),
+                )),
             },
             stop_flag(),
             std::sync::Arc::new(stats::ReceiverStats::default()),

@@ -25,17 +25,35 @@ Windows (игра) ──WASAPI loopback──> st send ──UDP/LAN──> st 
 Для музыки, видео и казуальных игр — нормально. Для соревновательных шутеров
 подключите к Mac **проводные** наушники: останется только наша часть.
 
-## Сборка
+## Готовые сборки (GitHub Releases)
 
-### Windows (уже собрано)
+Каждый тег `v*` автоматически собирается в GitHub Actions: `SoundTransfer-windows.zip`
+(st.exe) и `SoundTransfer-macos.zip` (SoundTransfer.app). Скачали → распаковали → готово.
 
-```powershell
-$env:CARGO_TARGET_DIR = "C:\Users\mirap\.cargo-target\soundtransfer"; cargo build --release
-# бинарник: C:\Users\mirap\.cargo-target\soundtransfer\release\st.exe
+Выпустить новый релиз:
+
+```bash
+git tag v0.2.0 && git push origin master --tags
 ```
 
-(`CARGO_TARGET_DIR` выносит артефакты сборки из OneDrive, чтобы синхронизация не мешала.
-В репозитории этот путь не хранится — он Windows-специфичный и ломал бы сборку на Mac.)
+macOS при первом запуске скачанного приложения скажет «не удаётся проверить
+разработчика»: откройте через правый клик → «Открыть», либо снимите карантин:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/SoundTransfer.app
+```
+
+## Сборка
+
+### Windows
+
+```powershell
+cargo build --release
+# бинарник: target\release\st.exe
+```
+
+Совет: если проект лежит в синхронизируемой папке (OneDrive и т.п.), вынесите
+артефакты сборки наружу: `$env:CARGO_TARGET_DIR = "C:\dev\st-target"` перед сборкой.
 
 ### Mac
 

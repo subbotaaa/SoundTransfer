@@ -96,6 +96,14 @@ enum Discovery {
     Failed(String),
 }
 
+enum UpdateState {
+    Unknown,
+    UpToDate,
+    Available(crate::update::Latest),
+    Installing,
+    Failed(String),
+}
+
 /// Иконка в системном трее (Windows) / строке меню (macOS) с меню
 /// Показать / Запустить / Остановить / Выход. Команды меню идут через
 /// тот же канал, что и Home Assistant (`ControlState::pending`), а
@@ -196,6 +204,10 @@ enum Mode {
     Recv,
 }
 
+fn default_volume() -> f32 {
+    1.0
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Settings {
     mode: Mode,
@@ -203,6 +215,9 @@ struct Settings {
     port: u16,
     buffer_ms: u32,
     device: String,
+    /// Громкость приёмника 0..1.5 (default — чтобы старые настройки читались).
+    #[serde(default = "default_volume")]
+    volume: f32,
 }
 
 impl Default for Settings {
@@ -214,6 +229,7 @@ impl Default for Settings {
             port: DEFAULT_PORT,
             buffer_ms: 20,
             device: String::new(),
+            volume: 1.0,
         }
     }
 }
@@ -263,6 +279,11 @@ pub struct App {
     control: Arc<ControlState>,
     _tray: Option<tray_icon::TrayIcon>,
     tray_cmd: Arc<TrayCmd>,
+    /// Громкость приёмника — общая с потоком приёма (live).
+    volume: Arc<std::sync::atomic::AtomicU32>,
+    update: Arc<std::sync::Mutex<UpdateState>>,
+    /// Сглаженный уровень для VU-метра.
+    vu_level: f32,
     /// --hidden: спрятать окно вскоре после старта. eframe 0.35 сам
     /// показывает окно после первого кадра, игнорируя with_visible(false),
     /// поэтому прячем с небольшой задержкой, когда его логика уже отработала.
@@ -282,6 +303,39 @@ impl App {
 
         let (tray, tray_cmd) = setup_tray(&cc.egui_ctx, &control);
 
+        let volume = Arc::new(std::sync::atomic::AtomicU32::new(
+            settings.volume.to_bits(),
+        ));
+        control
+            .volume
+            .store(settings.volume.to_bits(), Ordering::Relaxed);
+
+        // Фоновая проверка обновлений: при старте и раз в 6 часов.
+        let update = Arc::new(std::sync::Mutex::new(UpdateState::Unknown));
+        {
+            let update = update.clone();
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(3));
+                    let state = match crate::update::check() {
+                        Ok(Some(latest)) => UpdateState::Available(latest),
+                        Ok(None) => UpdateState::UpToDate,
+                        Err(e) => {
+                            log::warn!("проверка обновлений: {e:#}");
+                            UpdateState::Unknown
+                        }
+                    };
+                    let found = matches!(state, UpdateState::Available(_));
+                    *update.lock().unwrap() = state;
+                    if found {
+                        ctx.request_repaint();
+                    }
+                    std::thread::sleep(Duration::from_secs(6 * 3600));
+                }
+            });
+        }
+
         Self {
             settings,
             running: None,
@@ -293,9 +347,19 @@ impl App {
             control,
             _tray: tray,
             tray_cmd,
+            volume,
+            update,
+            vu_level: 0.0,
             hide_deadline: hidden
                 .then(|| std::time::Instant::now() + Duration::from_millis(150)),
         }
+    }
+
+    fn set_volume(&mut self, v: f32) {
+        let v = v.clamp(0.0, 1.5);
+        self.settings.volume = v;
+        self.volume.store(v.to_bits(), Ordering::Relaxed);
+        self.control.volume.store(v.to_bits(), Ordering::Relaxed);
     }
 
     fn start_discovery(&mut self) {
@@ -382,6 +446,7 @@ impl App {
                     port: self.settings.port,
                     buffer_ms: self.settings.buffer_ms,
                     device,
+                    volume: self.volume.clone(),
                 };
                 let s2 = stats.clone();
                 let stop2 = stop.clone();
@@ -426,7 +491,7 @@ impl App {
                             !busy,
                             egui::TextEdit::singleline(&mut self.settings.target_ip)
                                 .desired_width(140.0)
-                                .hint_text("192.168.1.44"),
+                                .hint_text("например, 192.168.1.10"),
                         );
                         let searching = matches!(
                             *self.discovery.lock().unwrap(),
@@ -447,6 +512,20 @@ impl App {
                         !busy,
                         egui::Slider::new(&mut self.settings.buffer_ms, 5..=100).suffix(" мс"),
                     );
+                    ui.end_row();
+
+                    ui.label("Громкость:");
+                    let mut vol_pct = (self.settings.volume * 100.0).round();
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut vol_pct, 0.0..=150.0)
+                                .suffix(" %")
+                                .integer(),
+                        )
+                        .changed()
+                    {
+                        self.set_volume(vol_pct / 100.0);
+                    }
                     ui.end_row();
                 }
 
@@ -487,6 +566,66 @@ impl App {
                 });
                 ui.end_row();
             });
+    }
+
+    /// Запуск установки обновления (кнопка в баннере или POST /update).
+    fn trigger_install(&mut self) {
+        let latest = {
+            let g = self.update.lock().unwrap();
+            match &*g {
+                UpdateState::Available(l) => l.clone(),
+                _ => return,
+            }
+        };
+        // Останавливаем поток перед заменой бинарника.
+        self.stop();
+        *self.update.lock().unwrap() = UpdateState::Installing;
+        let slot = self.update.clone();
+        std::thread::spawn(move || {
+            // При успехе install() перезапускает процесс и не возвращается.
+            if let Err(e) = crate::update::install(&latest) {
+                *slot.lock().unwrap() = UpdateState::Failed(format!("{e:#}"));
+            }
+        });
+    }
+
+    fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
+        let mut install = false;
+        {
+            let g = self.update.lock().unwrap();
+            match &*g {
+                UpdateState::Available(l) => {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("⬆ Доступна версия {}", l.version))
+                                .color(egui::Color32::from_rgb(230, 190, 60)),
+                        );
+                        if ui.button("Обновить").clicked() {
+                            install = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+                UpdateState::Installing => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Скачиваю и устанавливаю обновление…");
+                    });
+                    ui.add_space(4.0);
+                }
+                UpdateState::Failed(e) => {
+                    ui.label(
+                        egui::RichText::new(format!("Обновление не удалось: {e}"))
+                            .color(egui::Color32::LIGHT_RED),
+                    );
+                    ui.add_space(4.0);
+                }
+                _ => {}
+            }
+        }
+        if install {
+            self.trigger_install();
+        }
     }
 
     fn ui_discovery(&mut self, ui: &mut egui::Ui) {
@@ -547,6 +686,12 @@ impl App {
     fn ui_stats(&mut self, ui: &mut egui::Ui) {
         let Some(r) = &self.running else { return };
         ui.separator();
+        // Сглаживание VU: быстрый подъём, плавный спад.
+        let raw = match r {
+            Running::Send { stats, .. } => crate::stats::load_f32(&stats.level),
+            Running::Recv { stats, .. } => crate::stats::load_f32(&stats.level),
+        };
+        self.vu_level = (self.vu_level * 0.85).max(raw);
         match r {
             Running::Send { stats, .. } => {
                 self.pkt_rate.update(&stats.pkts);
@@ -554,6 +699,7 @@ impl App {
                 if let Some(s) = get_msg(&stats.status) {
                     ui.label(egui::RichText::new(format!("▶ {s}")).strong());
                 }
+                vu_meter(ui, self.vu_level);
                 ui.label(format!(
                     "Отправка: {:.0} пак/с · {:.0} кбит/с",
                     self.pkt_rate.per_sec,
@@ -575,6 +721,7 @@ impl App {
                         ui.label("Жду отправителя…");
                     }
                 }
+                vu_meter(ui, self.vu_level);
                 ui.label(format!(
                     "Приём: {:.0} пак/с · {:.0} кбит/с · буфер {} мс",
                     self.pkt_rate.per_sec,
@@ -633,6 +780,13 @@ impl eframe::App for App {
             Some(false) if self.running.is_some() => self.stop(),
             _ => {}
         }
+        let pending_volume = { self.control.pending_volume.lock().unwrap().take() };
+        if let Some(v) = pending_volume {
+            self.set_volume(v);
+        }
+        if self.control.pending_update.swap(false, Ordering::Relaxed) {
+            self.trigger_install();
+        }
 
         // Команды трея: показать окно / выйти.
         if self.tray_cmd.show_window.swap(false, Ordering::Relaxed) {
@@ -669,6 +823,7 @@ impl eframe::App for App {
                 });
             });
             ui.add_space(8.0);
+            self.ui_update_banner(ui);
 
             let busy = self.running.is_some();
             ui.add_enabled_ui(!busy, |ui| {
@@ -725,12 +880,39 @@ impl eframe::App for App {
         }
 
         if self.running.is_some() {
-            ui.ctx().request_repaint_after(Duration::from_millis(250));
+            // Почаще — чтобы VU-метр двигался плавно.
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
     }
 
     fn on_exit(&mut self) {
         self.stop();
+    }
+}
+
+/// Полоска уровня сигнала: -60..0 дБ → 0..1 ширины, зелёный/жёлтый/красный.
+fn vu_meter(ui: &mut egui::Ui, level: f32) {
+    let width = ui.available_width().clamp(120.0, 300.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+    let db = if level > 1e-4 {
+        20.0 * level.log10()
+    } else {
+        -60.0
+    };
+    let t = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+    if t > 0.0 {
+        let mut fill = rect;
+        fill.set_width(rect.width() * t);
+        let color = if t > 0.92 {
+            egui::Color32::from_rgb(220, 60, 60)
+        } else if t > 0.78 {
+            egui::Color32::from_rgb(230, 190, 60)
+        } else {
+            egui::Color32::from_rgb(80, 190, 100)
+        };
+        painter.rect_filled(fill, 3.0, color);
     }
 }
 

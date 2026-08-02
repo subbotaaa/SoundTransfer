@@ -17,6 +17,12 @@ pub const CONTROL_PORT: u16 = 48101;
 pub struct ControlState {
     /// Команда от HTTP-потока к GUI: Some(true)=start, Some(false)=stop.
     pub pending: Mutex<Option<bool>>,
+    /// Запрошенная громкость (0..1.5), применяет GUI.
+    pub pending_volume: Mutex<Option<f32>>,
+    /// Запрос установки обновления (POST /update), применяет GUI.
+    pub pending_update: AtomicBool,
+    /// Текущая громкость для /status (f32 в битах, зеркалит GUI).
+    pub volume: std::sync::atomic::AtomicU32,
     /// Текущее состояние (выставляет GUI).
     pub running: AtomicBool,
     /// Человекочитаемое описание состояния для /status.
@@ -29,6 +35,9 @@ impl ControlState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             pending: Mutex::new(None),
+            pending_volume: Mutex::new(None),
+            pending_update: AtomicBool::new(false),
+            volume: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
             running: AtomicBool::new(false),
             info: Mutex::new(String::new()),
             repaint: Mutex::new(None),
@@ -38,13 +47,25 @@ impl ControlState {
 
 pub fn spawn(port: u16, state: Arc<ControlState>) {
     std::thread::spawn(move || {
-        let listener = match TcpListener::bind(("0.0.0.0", port)) {
-            Ok(l) => l,
-            Err(e) => {
-                log::warn!("порт управления :{port} занят ({e}) — управление из HA недоступно");
-                return;
+        // Несколько попыток: после самообновления старый процесс может
+        // ещё пару секунд держать порт.
+        let mut listener = None;
+        for attempt in 0..10 {
+            match TcpListener::bind(("0.0.0.0", port)) {
+                Ok(l) => {
+                    listener = Some(l);
+                    break;
+                }
+                Err(e) if attempt == 9 => {
+                    log::warn!(
+                        "порт управления :{port} занят ({e}) — управление из HA недоступно"
+                    );
+                    return;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
             }
-        };
+        }
+        let listener = listener.unwrap();
         log::info!("управление: http://0.0.0.0:{port} (/start, /stop, /status)");
         for stream in listener.incoming() {
             let Ok(mut sock) = stream else { continue };
@@ -84,13 +105,35 @@ fn route(request_line: &str, state: &ControlState) -> (&'static str, String) {
         ("GET", "/status") | ("GET", "/") => {
             let running = state.running.load(Ordering::Relaxed);
             let info = state.info.lock().unwrap().clone();
+            let volume =
+                (f32::from_bits(state.volume.load(Ordering::Relaxed)) * 100.0).round() as u32;
             (
                 "200 OK",
                 format!(
-                    r#"{{"running":{running},"info":"{}"}}"#,
+                    r#"{{"running":{running},"volume":{volume},"info":"{}"}}"#,
                     info.replace('"', "'")
                 ),
             )
+        }
+        // POST /volume/80 — громкость приёмника в процентах (0..150).
+        ("POST", p) if p.starts_with("/volume/") => {
+            match p["/volume/".len()..].parse::<u32>() {
+                Ok(pct) if pct <= 150 => {
+                    *state.pending_volume.lock().unwrap() = Some(pct as f32 / 100.0);
+                    wake(state);
+                    ("200 OK", format!(r#"{{"ok":true,"volume":{pct}}}"#))
+                }
+                _ => (
+                    "400 Bad Request",
+                    r#"{"ok":false,"error":"volume 0..150"}"#.to_string(),
+                ),
+            }
+        }
+        // POST /update — установить доступное обновление (если есть).
+        ("POST", "/update") => {
+            state.pending_update.store(true, Ordering::Relaxed);
+            wake(state);
+            ("200 OK", r#"{"ok":true,"cmd":"update"}"#.to_string())
         }
         _ => ("404 Not Found", r#"{"ok":false}"#.to_string()),
     }

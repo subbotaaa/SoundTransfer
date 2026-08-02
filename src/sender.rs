@@ -210,6 +210,8 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>, stats: Arc<SenderStats>) -> Re
             cons.pop_slice(&mut fbuf);
             last_real_data = Instant::now();
             synth_deadline = None;
+            let peak = fbuf.iter().fold(0f32, |m, s| m.max(s.abs()));
+            crate::stats::store_f32(&stats.level, peak);
             send_packet(
                 &sock,
                 &mut header,
@@ -226,6 +228,7 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>, stats: Arc<SenderStats>) -> Re
             let now = Instant::now();
             let deadline = *synth_deadline.get_or_insert(now);
             if now >= deadline {
+                crate::stats::store_f32(&stats.level, 0.0);
                 send_packet(
                     &sock,
                     &mut header,

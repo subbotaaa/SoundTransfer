@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        run: Compress-Archive -Path target/release/st.exe -DestinationPath SoundTransfer-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SoundTransfer-windows
+          path: SoundTransfer-windows.zip
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SoundTransfer-windows.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build .app bundle
+        run: sh make_app.sh
+      - name: Package (ditto сохраняет права на исполняемый файл)
+        run: ditto -c -k --keepParent SoundTransfer.app SoundTransfer-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SoundTransfer-macos
+          path: SoundTransfer-macos.zip
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SoundTransfer-macos.zip
