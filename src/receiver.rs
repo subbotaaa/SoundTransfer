@@ -1,5 +1,5 @@
 //! Приёмник: UDP → seq-трекинг/джиттер → кольцевой буфер → cpal playback.
-//! Работает и на macOS (CoreAudio), и на Windows (для localhost-теста).
+//! Работает и на macOS (CoreAudio), и на Windows (WASAPI).
 
 use std::net::UdpSocket;
 use std::sync::Arc;

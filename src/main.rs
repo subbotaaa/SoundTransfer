@@ -12,9 +12,7 @@ mod protocol;
 mod receiver;
 mod stats;
 
-#[cfg(windows)]
 mod capture;
-#[cfg(windows)]
 mod sender;
 
 use std::path::PathBuf;
@@ -30,7 +28,7 @@ use protocol::DEFAULT_PORT;
 #[derive(Parser)]
 #[command(
     name = "st",
-    about = "SoundTransfer — передача системного звука Windows → Mac по локальной сети"
+    about = "SoundTransfer — передача звука с одного устройства на другое по локальной сети"
 )]
 struct Cli {
     /// Без подкоманды (двойной клик) открывается окно приложения.
@@ -53,9 +51,9 @@ enum FormatArg {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Захват системного звука и отправка на приёмник (только Windows)
+    /// Захват звука и отправка на приёмник
     Send {
-        /// IP или имя хоста приёмника (Mac). Не нужен при --dump
+        /// IP или имя хоста приёмника. Не нужен при --dump
         target: Option<String>,
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
@@ -74,7 +72,7 @@ enum Cmd {
         #[arg(long, default_value_t = 10.0)]
         seconds: f32,
     },
-    /// Приём и воспроизведение (Mac; работает и на Windows для теста)
+    /// Приём и воспроизведение
     Recv {
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
@@ -155,7 +153,6 @@ fn main() -> Result<()> {
     }
 }
 
-#[cfg(windows)]
 fn run_send(
     target: Option<String>,
     port: u16,
@@ -185,7 +182,7 @@ fn run_send(
                 log::info!("найден: {} — {}:{}", f.name, f.ip, f.port);
             }
             let first = found.first().context(
-                "приёмник не найден: запустите `st recv` на Mac или укажите IP явно",
+                "приёмник не найден: запустите `st recv` на другом устройстве или укажите IP явно",
             )?;
             SocketAddr::new(first.ip, first.port)
         }
@@ -210,18 +207,6 @@ fn run_send(
     )
 }
 
-#[cfg(not(windows))]
-fn run_send(
-    _target: Option<String>,
-    _port: u16,
-    _frames_per_packet: usize,
-    _format: FormatArg,
-    _device: Option<String>,
-    _dump: Option<PathBuf>,
-    _seconds: f32,
-) -> Result<()> {
-    anyhow::bail!("режим send доступен только на Windows (захват WASAPI loopback)")
-}
 
 fn list_devices() -> Result<()> {
     let host = cpal::default_host();

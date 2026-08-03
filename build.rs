@@ -5,7 +5,7 @@ fn main() {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico");
         res.set("ProductName", "SoundTransfer");
-        res.set("FileDescription", "SoundTransfer — звук Windows на Mac");
+        res.set("FileDescription", "SoundTransfer — передача звука между устройствами");
         if let Err(e) = res.compile() {
             println!("cargo:warning=не удалось вшить иконку: {e}");
         }

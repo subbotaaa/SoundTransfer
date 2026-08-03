@@ -224,7 +224,8 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            // На Windows чаще нужен отправитель, на Mac — приёмник.
+            // Стартовый дефолт (типовая связка пользователя): Windows — отправка,
+            // остальные ОС — приём; сохранённый выбор режима его перекрывает.
             mode: if cfg!(windows) { Mode::Send } else { Mode::Recv },
             target_ip: String::new(),
             port: DEFAULT_PORT,
@@ -272,7 +273,11 @@ impl Running {
 pub struct App {
     settings: Settings,
     running: Option<Running>,
+    /// Устройства вывода — для режима приёма (и захвата loopback на Windows).
     devices: Vec<String>,
+    /// Источники захвата для отправки: на Windows совпадают с устройствами
+    /// вывода (WASAPI loopback), на остальных ОС — входные устройства.
+    capture_devices: Vec<String>,
     pkt_rate: RateMeter,
     byte_rate: RateMeter,
     last_error: Option<String>,
@@ -330,6 +335,7 @@ impl App {
             settings,
             running: None,
             devices: list_output_devices(),
+            capture_devices: list_capture_devices(),
             pkt_rate: RateMeter::new(),
             byte_rate: RateMeter::new(),
             last_error: None,
@@ -378,58 +384,50 @@ impl App {
         };
         match self.settings.mode {
             Mode::Send => {
-                #[cfg(windows)]
-                {
-                    // Пустой IP (напр., старт из Home Assistant на чистых
-                    // настройках) — ищем приёмник в сети сами.
-                    if self.settings.target_ip.trim().is_empty() {
-                        match discovery::discover(Duration::from_secs(3)) {
-                            Ok(found) if !found.is_empty() => {
-                                self.settings.target_ip = found[0].ip.to_string();
-                                self.settings.port = found[0].port;
-                            }
-                            _ => {
-                                self.last_error = Some(
-                                    "Приёмник не найден — запустите приём на Mac или укажите IP"
-                                        .to_string(),
-                                );
-                                return;
-                            }
+                // Пустой IP (напр., старт из Home Assistant на чистых
+                // настройках) — ищем приёмник в сети сами.
+                if self.settings.target_ip.trim().is_empty() {
+                    match discovery::discover(Duration::from_secs(3)) {
+                        Ok(found) if !found.is_empty() => {
+                            self.settings.target_ip = found[0].ip.to_string();
+                            self.settings.port = found[0].port;
                         }
-                    }
-                    let stats = Arc::new(SenderStats::default());
-                    let target = format!("{}:{}", self.settings.target_ip.trim(), self.settings.port);
-                    use std::net::ToSocketAddrs;
-                    let addr = match target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
-                        Some(a) => a,
-                        None => {
-                            self.last_error = Some(format!("Некорректный адрес: {target}"));
+                        _ => {
+                            self.last_error = Some(
+                                "Приёмник не найден — запустите приём на другом устройстве или укажите IP"
+                                    .to_string(),
+                            );
                             return;
                         }
-                    };
-                    let opts = crate::sender::SendOpts {
-                        target: addr,
-                        frames_per_packet: 128,
-                        wire_format: crate::protocol::WireFormat::S16le,
-                        device,
-                    };
-                    let s2 = stats.clone();
-                    let stop2 = stop.clone();
-                    let join = std::thread::spawn(move || {
-                        if let Err(e) = crate::sender::run(opts, stop2, s2.clone()) {
-                            set_msg(&s2.error, format!("{e:#}"));
-                        }
-                    });
-                    self.running = Some(Running::Send { stop, join, stats });
-                    self.control.running.store(true, Ordering::Relaxed);
-                    *self.control.info.lock().unwrap() =
-                        format!("send:{}", self.settings.target_ip.trim());
+                    }
                 }
-                #[cfg(not(windows))]
-                {
-                    self.last_error =
-                        Some("Отправка работает только на Windows".to_string());
-                }
+                let stats = Arc::new(SenderStats::default());
+                let target = format!("{}:{}", self.settings.target_ip.trim(), self.settings.port);
+                use std::net::ToSocketAddrs;
+                let addr = match target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+                    Some(a) => a,
+                    None => {
+                        self.last_error = Some(format!("Некорректный адрес: {target}"));
+                        return;
+                    }
+                };
+                let opts = crate::sender::SendOpts {
+                    target: addr,
+                    frames_per_packet: 128,
+                    wire_format: crate::protocol::WireFormat::S16le,
+                    device,
+                };
+                let s2 = stats.clone();
+                let stop2 = stop.clone();
+                let join = std::thread::spawn(move || {
+                    if let Err(e) = crate::sender::run(opts, stop2, s2.clone()) {
+                        set_msg(&s2.error, format!("{e:#}"));
+                    }
+                });
+                self.running = Some(Running::Send { stop, join, stats });
+                self.control.running.store(true, Ordering::Relaxed);
+                *self.control.info.lock().unwrap() =
+                    format!("send:{}", self.settings.target_ip.trim());
             }
             Mode::Recv => {
                 let stats = Arc::new(ReceiverStats::default());
@@ -476,7 +474,7 @@ impl App {
             .spacing([12.0, 8.0])
             .show(ui, |ui| {
                 if self.settings.mode == Mode::Send {
-                    ui.label("IP приёмника (Mac):");
+                    ui.label("IP приёмника:");
                     ui.horizontal(|ui| {
                         ui.add_enabled(
                             !busy,
@@ -490,7 +488,7 @@ impl App {
                         );
                         if ui
                             .add_enabled(!busy && !searching, egui::Button::new("🔍 Найти"))
-                            .on_hover_text("Найти Mac с запущенным приёмником (mDNS)")
+                            .on_hover_text("Найти устройство с запущенным приёмником (mDNS)")
                             .clicked()
                         {
                             self.start_discovery();
@@ -532,6 +530,11 @@ impl App {
                 } else {
                     "Вывод в устройство:"
                 });
+                let devices = if self.settings.mode == Mode::Send {
+                    &self.capture_devices
+                } else {
+                    &self.devices
+                };
                 ui.add_enabled_ui(!busy, |ui| {
                     egui::ComboBox::from_id_salt("device")
                         .width(220.0)
@@ -546,7 +549,7 @@ impl App {
                                 String::new(),
                                 "По умолчанию (системное)",
                             );
-                            for d in &self.devices {
+                            for d in devices {
                                 ui.selectable_value(
                                     &mut self.settings.device,
                                     d.clone(),
@@ -676,7 +679,7 @@ impl App {
             Discovery::Done(found) if found.is_empty() => {
                 ui.label(
                     egui::RichText::new(
-                        "Не найдено — убедитесь, что на Mac запущен приём",
+                        "Не найдено — убедитесь, что на другом устройстве запущен приём",
                     )
                     .color(egui::Color32::GRAY),
                 );
@@ -851,7 +854,7 @@ impl eframe::App for App {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new("Windows » Mac по локальной сети")
+                        egui::RichText::new("звук по локальной сети")
                             .small()
                             .color(egui::Color32::GRAY),
                     );
@@ -869,8 +872,13 @@ impl eframe::App for App {
             });
             if self.settings.mode == Mode::Send && !cfg!(windows) {
                 ui.label(
-                    egui::RichText::new("Отправка звука работает только на Windows")
-                        .color(egui::Color32::LIGHT_RED),
+                    egui::RichText::new(
+                        "Для системного звука на macOS направьте вывод системы в \
+                         виртуальное устройство (например, BlackHole) и выберите \
+                         его как источник захвата",
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
                 );
             }
             ui.add_space(8.0);
@@ -880,7 +888,7 @@ impl eframe::App for App {
             ui.add_space(12.0);
 
             let can_start = match self.settings.mode {
-                Mode::Send => cfg!(windows) && !self.settings.target_ip.trim().is_empty(),
+                Mode::Send => !self.settings.target_ip.trim().is_empty(),
                 Mode::Recv => true,
             };
             if self.running.is_none() {
@@ -979,6 +987,23 @@ fn list_output_devices() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn list_capture_devices() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        list_output_devices()
+    }
+    #[cfg(not(windows))]
+    {
+        let host = cpal::default_host();
+        host.input_devices()
+            .map(|it| {
+                it.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 pub fn run(hidden: bool) -> Result<()> {
