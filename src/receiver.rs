@@ -1,10 +1,10 @@
 //! Приёмник: UDP → seq-трекинг/джиттер → кольцевой буфер → cpal playback.
 //! Работает и на macOS (CoreAudio), и на Windows (WASAPI).
 
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -37,6 +37,22 @@ struct Shared {
 const MAX_GAP_MS: u64 = 500;
 /// Порог среза переполнения: target + 40 мс.
 const CUT_OVER_TARGET_MS: u32 = 40;
+/// Сколько текущий отправитель может молчать, прежде чем мы примем другого.
+/// Отправитель шлёт HELLO раз в секунду, аудио — сотни пакетов в секунду.
+const PEER_SILENCE: Duration = Duration::from_millis(1500);
+/// Полная тишина в сети — закрываем вывод и снова ждём отправителя.
+const IDLE_RESTART: Duration = Duration::from_secs(10);
+/// Как часто подтверждаем отправителю, что поток доходит.
+const ACK_PERIOD: Duration = Duration::from_secs(1);
+
+/// Чем закончилась сессия с конкретным отправителем.
+enum Next {
+    /// Взведён stop — выходим совсем.
+    Stop,
+    /// Нужен новый аудиопоток. `Some` — уже знаем нового отправителя
+    /// (сменился формат), `None` — ждём заново.
+    Restart(Option<(Header, SocketAddr)>),
+}
 
 pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", opts.port))
@@ -54,27 +70,82 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> 
         }
     };
 
-    // Ждём первый валидный пакет: из него узнаём формат и адрес отправителя.
-    let mut buf = vec![0u8; 65536];
-    let (first, peer) = loop {
+    // Сессия живёт, пока не сменился формат и отправитель не пропал совсем;
+    // всё остальное (перезапуск отправителя, смена его порта) чиним на лету.
+    let mut pending: Option<(Header, SocketAddr)> = None;
+    loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        match sock.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                if let Some(h) = Header::parse(&buf[..n]) {
-                    break (h, from);
+        let (first, peer) = match pending.take() {
+            Some(known) => known,
+            None => {
+                set_msg(&stats.status, "жду отправителя…");
+                stats.linked.store(false, Ordering::Relaxed);
+                match wait_for_sender(&sock, &stop)? {
+                    Some(found) => found,
+                    None => return Ok(()),
                 }
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
+        };
+        match session(&sock, &opts, &stats, &stop, first, peer)? {
+            Next::Stop => return Ok(()),
+            Next::Restart(next) => pending = next,
+        }
+    }
+}
+
+/// Ждёт первый валидный пакет: из него узнаём формат и адрес отправителя.
+/// `None` — сработал stop.
+fn wait_for_sender(
+    sock: &UdpSocket,
+    stop: &AtomicBool,
+) -> Result<Option<(Header, SocketAddr)>> {
+    let mut buf = vec![0u8; 65536];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match sock.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                if let Some(h) = Header::parse(&buf[..n])
+                    && h.ptype != PacketType::Ack
+                {
+                    return Ok(Some((h, from)));
+                }
             }
+            Err(e) if recoverable(&e) => continue,
             Err(e) => return Err(e.into()),
         }
-    };
+    }
+}
+
+/// Ошибки чтения, после которых сокет остаётся рабочим.
+///
+/// `ConnectionReset` на UDP — это особенность Windows: если наш ACK ушёл на
+/// порт, где отправителя уже нет, приходит ICMP «порт недоступен», и ближайший
+/// `recv_from` падает с WSAECONNRESET. Ронять из-за этого приём нельзя —
+/// отправитель как раз перезапускается и сейчас появится снова.
+fn recoverable(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Один аудиопоток: держим вывод открытым, пока формат не поменялся.
+fn session(
+    sock: &UdpSocket,
+    opts: &RecvOpts,
+    stats: &ReceiverStats,
+    stop: &AtomicBool,
+    first: Header,
+    initial_peer: SocketAddr,
+) -> Result<Next> {
+    let mut peer = initial_peer;
     log::info!(
         "отправитель {}: {} Гц, {} канала(ов), {:?}",
         peer,
@@ -178,6 +249,7 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> 
     out_stream.play()?;
 
     // --- Сетевой цикл ---
+    let mut buf = vec![0u8; 65536];
     let mut tracker = SeqTracker::new();
     let mut drift = DriftComp::new(target_frames as u32, sample_rate);
     let mut decoded: Vec<f32> = Vec::with_capacity(4096);
@@ -186,29 +258,75 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> 
     let mut pkts = 0u64;
     let mut bytes = 0u64;
     let mut ring_overflow = 0u64;
-    let mut warned_format = false;
+    let mut last_from_peer = Instant::now();
+    let mut last_audio = Instant::now();
+    let mut ack_timer = Instant::now() - ACK_PERIOD;
+    let mut ack_buf = [0u8; HEADER_LEN];
+    stats.linked.store(true, Ordering::Relaxed);
 
     while !stop.load(Ordering::Relaxed) {
+        // Подтверждение отправителю: «поток доходит». Он показывает это
+        // в GUI и отдаёт в /status, чтобы Home Assistant видел правду.
+        if ack_timer.elapsed() >= ACK_PERIOD {
+            ack_timer = Instant::now();
+            Header {
+                ptype: PacketType::Ack,
+                channels: channels as u8,
+                format: first.format,
+                sample_rate,
+                seq: 0,
+                sample_pos: shared.frames_played.load(Ordering::Relaxed),
+            }
+            .write(&mut ack_buf);
+            let _ = sock.send_to(&ack_buf, peer);
+        }
+
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
-                if from != peer {
-                    continue; // чужие датаграммы игнорируем
-                }
                 let Some(h) = Header::parse(&buf[..n]) else {
                     continue;
                 };
-                if h.sample_rate != sample_rate || h.channels as usize != channels {
-                    if !warned_format {
-                        log::warn!(
-                            "отправитель сменил формат ({} Гц, {} кан) — перезапустите приёмник",
-                            h.sample_rate,
-                            h.channels
-                        );
-                        warned_format = true;
+                if h.ptype == PacketType::Ack {
+                    continue; // наше же эхо/чужой приёмник — не наше дело
+                }
+                if from != peer {
+                    // Отправитель перезапустился: у него эфемерный исходящий
+                    // порт, после каждого старта новый. Раньше мы намертво
+                    // держались за старый адрес и молча выбрасывали весь
+                    // поток — приходилось перезапускать приёмник руками.
+                    let takeover = h.ptype == PacketType::Hello
+                        || last_from_peer.elapsed() >= PEER_SILENCE;
+                    if !takeover {
+                        continue; // текущий отправитель жив — чужих игнорируем
                     }
-                    continue;
+                    if h.sample_rate != sample_rate || h.channels as usize != channels {
+                        log::info!("новый отправитель {from} с другим форматом — пересобираю вывод");
+                        return Ok(Next::Restart(Some((h, from))));
+                    }
+                    log::info!("отправитель сменился: {peer} » {from}");
+                    peer = from;
+                    tracker.reset();
+                    drift = DriftComp::new(target_frames as u32, sample_rate);
+                    shared.prebuffering.store(true, Ordering::Relaxed);
+                    ack_timer = Instant::now() - ACK_PERIOD;
+                    set_msg(
+                        &stats.status,
+                        format!("{peer} » {sample_rate} Гц, {channels} кан"),
+                    );
+                }
+                last_from_peer = Instant::now();
+                if h.sample_rate != sample_rate || h.channels as usize != channels {
+                    // Тот же отправитель сменил формат (другое устройство
+                    // захвата) — раньше это требовало ручного перезапуска.
+                    log::info!(
+                        "формат сменился: {} Гц, {} кан — пересобираю вывод",
+                        h.sample_rate,
+                        h.channels
+                    );
+                    return Ok(Next::Restart(Some((h, from))));
                 }
                 match h.ptype {
+                    PacketType::Ack => {}
                     PacketType::Hello => {}
                     PacketType::Bye => {
                         log::info!("отправитель завершил передачу (BYE)");
@@ -216,6 +334,7 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> 
                         tracker.reset();
                     }
                     PacketType::Audio => {
+                        last_audio = Instant::now();
                         pkts += 1;
                         bytes += n as u64;
                         stats.pkts.fetch_add(1, Ordering::Relaxed);
@@ -284,10 +403,20 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> 
                     }
                 }
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) if recoverable(&e) => {}
             Err(e) => return Err(e.into()),
+        }
+
+        // Отправителя нет совсем — отпускаем устройство вывода и ждём заново.
+        if last_audio.elapsed() >= IDLE_RESTART {
+            log::info!(
+                "отправитель молчит {} с — освобождаю вывод и жду заново",
+                IDLE_RESTART.as_secs()
+            );
+            stats.linked.store(false, Ordering::Relaxed);
+            crate::stats::store_f32(&stats.level, 0.0);
+            stats.fill_ms.store(0, Ordering::Relaxed);
+            return Ok(Next::Restart(None));
         }
 
         if ticker.tick() {
@@ -309,6 +438,7 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> 
                 .slip_duplicated
                 .store(drift.duplicated_frames, Ordering::Relaxed);
             stats.ring_overflow.store(ring_overflow, Ordering::Relaxed);
+            stats.linked.store(pkts > 0, Ordering::Relaxed);
             log::info!(
                 "rx: {} пак/с, {:.1} кбит/с | буфер {} мс (EMA {:.1} мс) | потеряно {}, поздних {}, underruns {}, срезов {}, slip -{}/+{}, ring overflow {}",
                 pkts,
@@ -332,7 +462,7 @@ pub fn run(opts: RecvOpts, stop: Arc<AtomicBool>, stats: Arc<ReceiverStats>) -> 
         "остановлено; всего воспроизведено {} с",
         shared.frames_played.load(Ordering::Relaxed) / sample_rate as u64
     );
-    Ok(())
+    Ok(Next::Stop)
 }
 
 fn pick_output_config(

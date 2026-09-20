@@ -1,7 +1,7 @@
 //! Статистика, разделяемая между рабочими потоками, CLI-логом и GUI.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub struct EverySecond {
@@ -45,6 +45,11 @@ pub struct SenderStats {
     pub ring_overflow: AtomicU64,
     /// Пиковый уровень последнего пакета, 0..1 (f32 в битах).
     pub level: std::sync::atomic::AtomicU32,
+    /// Приёмник подтвердил приём (ACK не старше пары секунд).
+    pub ack_fresh: AtomicBool,
+    /// Хоть один ACK был — иначе на той стороне версия до 0.2.4,
+    /// которая подтверждений не шлёт, и судить по ним нельзя.
+    pub ack_seen: AtomicBool,
     /// Строка состояния («48000 Гц, 2 кан » IP:порт»).
     pub status: Mutex<Option<String>>,
     /// Ошибка, завершившая работу (для показа в GUI).
@@ -67,6 +72,8 @@ pub struct ReceiverStats {
     pub slip_dropped: AtomicU64,
     pub slip_duplicated: AtomicU64,
     pub ring_overflow: AtomicU64,
+    /// Поток от отправителя реально идёт (пакеты были в последнюю секунду).
+    pub linked: AtomicBool,
     pub status: Mutex<Option<String>>,
     pub error: Mutex<Option<String>>,
 }

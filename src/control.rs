@@ -25,6 +25,13 @@ pub struct ControlState {
     pub volume: std::sync::atomic::AtomicU32,
     /// Текущее состояние (выставляет GUI).
     pub running: AtomicBool,
+    /// Тракт реально работает: у отправителя — приёмник подтверждает приём,
+    /// у приёмника — пакеты идут. `running` без `linked` означает «запущено,
+    /// но звук не доходит» — именно этот случай и нужно ловить автоматикой.
+    pub linked: AtomicBool,
+    /// Вторая сторона старой версии (до 0.2.4) и подтверждений не шлёт —
+    /// судить по `linked` нельзя, отдаём null.
+    pub link_unknown: AtomicBool,
     /// Человекочитаемое описание состояния для /status.
     pub info: Mutex<String>,
     /// Контекст egui — чтобы разбудить update() после команды.
@@ -39,6 +46,8 @@ impl ControlState {
             pending_update: AtomicBool::new(false),
             volume: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
             running: AtomicBool::new(false),
+            linked: AtomicBool::new(false),
+            link_unknown: AtomicBool::new(true),
             info: Mutex::new(String::new()),
             repaint: Mutex::new(None),
         })
@@ -107,10 +116,16 @@ fn route(request_line: &str, state: &ControlState) -> (&'static str, String) {
             let info = state.info.lock().unwrap().clone();
             let volume =
                 (f32::from_bits(state.volume.load(Ordering::Relaxed)) * 100.0).round() as u32;
+            // linked: null — вторая сторона старой версии, судить не по чему.
+            let linked = if !running || state.link_unknown.load(Ordering::Relaxed) {
+                "null".to_string()
+            } else {
+                state.linked.load(Ordering::Relaxed).to_string()
+            };
             (
                 "200 OK",
                 format!(
-                    r#"{{"running":{running},"volume":{volume},"info":"{}"}}"#,
+                    r#"{{"running":{running},"linked":{linked},"volume":{volume},"info":"{}"}}"#,
                     info.replace('"', "'")
                 ),
             )

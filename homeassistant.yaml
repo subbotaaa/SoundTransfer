@@ -21,6 +21,12 @@ rest_command:
     url: "http://RECEIVER_IP:48101/stop"
     method: post
 
+# /status отдаёт два разных факта:
+#   running — поток запущен (кнопка нажата);
+#   linked  — звук реально доходит до приёмника (подтверждения с той стороны).
+#             null, если вторая сторона старее 0.2.4 и подтверждений не шлёт.
+# Индикацию стоит вешать на linked: «запущено, но не доходит» — это как раз
+# тот случай, когда раньше приходилось перезапускать руками.
 rest:
   - resource: "http://SENDER_IP:48101/status"
     scan_interval: 10
@@ -28,6 +34,10 @@ rest:
       - name: soundtransfer_active
         unique_id: soundtransfer_active
         value_template: "{{ value_json.running }}"
+      - name: soundtransfer_linked
+        unique_id: soundtransfer_linked
+        value_template: "{{ value_json.linked }}"
+        availability: "{{ value_json.linked is not none }}"
 
 template:
   - switch:
@@ -43,3 +53,24 @@ template:
         turn_off:
           - action: rest_command.soundtransfer_sender_stop
           - action: rest_command.soundtransfer_receiver_stop
+
+# Страховка: передача запущена, но звук не доходит дольше минуты —
+# перезапускаем приёмник (именно он обычно и «залипает»).
+automation:
+  - alias: "SoundTransfer: автоперезапуск, если звук не доходит"
+    id: soundtransfer_selfheal
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.soundtransfer_linked
+        to: "off"
+        for: "00:01:00"
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.soundtransfer_active
+        state: "on"
+    actions:
+      - action: rest_command.soundtransfer_receiver_stop
+      - delay:
+          seconds: 2
+      - action: rest_command.soundtransfer_receiver_start

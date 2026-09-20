@@ -13,6 +13,9 @@ pub enum PacketType {
     Audio,
     Hello,
     Bye,
+    /// Приёмник » отправителю: «слышу тебя». Раз в секунду, чтобы отправитель
+    /// знал, что поток реально доходит, а не уходит в пустоту.
+    Ack,
 }
 
 impl PacketType {
@@ -21,6 +24,7 @@ impl PacketType {
             PacketType::Audio => 0,
             PacketType::Hello => 1,
             PacketType::Bye => 2,
+            PacketType::Ack => 3,
         }
     }
 
@@ -29,6 +33,7 @@ impl PacketType {
             0 => Some(PacketType::Audio),
             1 => Some(PacketType::Hello),
             2 => Some(PacketType::Bye),
+            3 => Some(PacketType::Ack),
             _ => None,
         }
     }

@@ -17,6 +17,9 @@ use crate::convert;
 use crate::protocol::{HEADER_LEN, Header, PacketType, WireFormat};
 use crate::stats::{EverySecond, SenderStats, set_msg};
 
+/// Без подтверждения дольше этого считаем, что приёмник нас не слышит.
+const ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub struct SendOpts {
     pub target: SocketAddr,
     pub frames_per_packet: usize,
@@ -114,6 +117,15 @@ fn send_packet(
             stats.pkts.fetch_add(1, Ordering::Relaxed);
             stats.bytes.fetch_add(n as u64, Ordering::Relaxed);
         }
+        // Сокет неблокирующий: переполнение очереди — не повод шуметь в лог,
+        // пакет просто теряется, как и полагается UDP. ConnectionReset —
+        // ICMP «порт недоступен» с той стороны (приёмник перезапускается):
+        // тоже не ошибка отправки, отсутствие ACK покажет это честнее.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionReset
+            ) => {}
         Err(e) => log::warn!("send: {e}"),
     }
     header.seq = header.seq.wrapping_add(1);
@@ -130,6 +142,9 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>, stats: Arc<SenderStats>) -> Re
     let sock = UdpSocket::bind(bind_addr).context("bind UDP")?;
     sock.connect(opts.target)
         .with_context(|| format!("connect {}", opts.target))?;
+    // Читаем ACK'и приёмника, не тормозя отправку: сокет connect'нут,
+    // так что приходят только датаграммы с адреса приёмника.
+    sock.set_nonblocking(true).context("nonblocking UDP")?;
 
     // Кольцевой буфер ~2 с — с запасом; сеть выгребает почти сразу.
     let overflow = Arc::new(AtomicU64::new(0));
@@ -181,6 +196,10 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>, stats: Arc<SenderStats>) -> Re
     let mut hello_timer = Instant::now() - Duration::from_secs(2);
     let mut pkts_sent = 0u64;
     let mut bytes_sent = 0u64;
+    // Подтверждения приёмника: без них поток может уходить в пустоту,
+    // а отправитель этого не замечал бы — как было до 0.2.4.
+    let mut last_ack: Option<Instant> = None;
+    let mut ack_buf = [0u8; HEADER_LEN];
 
     // WASAPI loopback молчит, когда в системе тишина. Чтобы приёмник не
     // пересобирал буфер после каждой паузы, при простое захвата синтезируем
@@ -192,6 +211,16 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>, stats: Arc<SenderStats>) -> Re
     let zero_payload = vec![0f32; samples_per_packet];
 
     while !stop.load(Ordering::Relaxed) {
+        // Разгребаем ACK'и приёмника (неблокирующе).
+        while let Ok(n) = sock.recv(&mut ack_buf) {
+            if let Some(h) = Header::parse(&ack_buf[..n])
+                && h.ptype == PacketType::Ack
+            {
+                last_ack = Some(Instant::now());
+                stats.ack_seen.store(true, Ordering::Relaxed);
+            }
+        }
+
         // HELLO раз в секунду: несёт параметры формата, позволяет приёмнику
         // залочить отправителя и пересинхронизироваться после рестарта.
         if hello_timer.elapsed() >= Duration::from_secs(1) {
@@ -251,12 +280,21 @@ pub fn run(opts: SendOpts, stop: Arc<AtomicBool>, stats: Arc<SenderStats>) -> Re
             stats
                 .ring_overflow
                 .store(overflow.load(Ordering::Relaxed), Ordering::Relaxed);
+            let fresh = last_ack.is_some_and(|t| t.elapsed() < ACK_TIMEOUT);
+            stats.ack_fresh.store(fresh, Ordering::Relaxed);
             log::info!(
-                "tx: {} пак/с, {:.1} кбит/с, ring {} мс, переполнений {}",
+                "tx: {} пак/с, {:.1} кбит/с, ring {} мс, переполнений {}, приёмник {}",
                 pkts_sent,
                 bytes_sent as f64 * 8.0 / 1000.0,
                 cons.occupied_len() / channels * 1000 / fmt.sample_rate as usize,
                 overflow.load(Ordering::Relaxed),
+                if fresh {
+                    "подтверждает"
+                } else if stats.ack_seen.load(Ordering::Relaxed) {
+                    "молчит"
+                } else {
+                    "без подтверждений"
+                },
             );
             pkts_sent = 0;
             bytes_sent = 0;

@@ -268,6 +268,21 @@ impl Running {
             Running::Recv { stats, .. } => get_msg(&stats.error),
         }
     }
+
+    /// Состояние тракта: `None` — судить не по чему (вторая сторона старой
+    /// версии и подтверждений не шлёт), иначе «звук реально доходит».
+    fn link(&self) -> Option<bool> {
+        match self {
+            Running::Send { stats, .. } => {
+                if stats.ack_seen.load(Ordering::Relaxed) {
+                    Some(stats.ack_fresh.load(Ordering::Relaxed))
+                } else {
+                    None
+                }
+            }
+            Running::Recv { stats, .. } => Some(stats.linked.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 pub struct App {
@@ -742,6 +757,23 @@ impl App {
                 if ovf > 0 {
                     ui.label(format!("Переполнений буфера захвата: {ovf}"));
                 }
+                // Отправлять можно и в пустоту — показываем, слышит ли нас
+                // приёмник на самом деле.
+                if stats.ack_seen.load(Ordering::Relaxed) {
+                    if stats.ack_fresh.load(Ordering::Relaxed) {
+                        ui.label(
+                            egui::RichText::new("Приёмник подтверждает приём")
+                                .color(egui::Color32::from_rgb(0x4C, 0xAF, 0x50)),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "Приёмник не подтверждает приём — звук не доходит",
+                            )
+                            .color(egui::Color32::LIGHT_RED),
+                        );
+                    }
+                }
             }
             Running::Recv { stats, .. } => {
                 self.pkt_rate.update(&stats.pkts);
@@ -804,6 +836,16 @@ impl eframe::App for App {
         // Рабочий поток мог завершиться сам (ошибка) — забираем состояние.
         if self.running.as_ref().is_some_and(|r| r.is_finished()) {
             self.stop();
+        }
+
+        // Зеркалим состояние тракта в /status — чтобы Home Assistant отличал
+        // «запущено» от «звук реально идёт».
+        match self.running.as_ref().and_then(|r| r.link()) {
+            Some(linked) => {
+                self.control.link_unknown.store(false, Ordering::Relaxed);
+                self.control.linked.store(linked, Ordering::Relaxed);
+            }
+            None => self.control.link_unknown.store(true, Ordering::Relaxed),
         }
 
         // Команды из Home Assistant (HTTP /start, /stop) и меню трея.
