@@ -160,6 +160,7 @@ st send --dump out.raw --seconds 10    # диагностика захвата: 
 ```text
 POST /start   — запустить передачу или приём (какой режим выбран в приложении)
 POST /stop    — остановить
+POST /update  — проверить обновления и установить, если вышла новая версия
 GET  /status  — {"running":true|false,"linked":true|false|null,"volume":100,"info":"..."}
 ```
 

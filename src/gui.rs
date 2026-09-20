@@ -310,6 +310,11 @@ pub struct App {
     /// показывает окно после первого кадра, игнорируя with_visible(false),
     /// поэтому прячем с небольшой задержкой, когда его логика уже отработала.
     hide_deadline: Option<std::time::Instant>,
+    /// POST /update пришёл, когда о свежей версии ещё не знали: проверяем и
+    /// ставим, как только проверка вернётся. Иначе обновить машину удалённо
+    /// (из Home Assistant) можно было только в те 6 часов, когда приложение
+    /// уже само заметило релиз.
+    install_after_check: bool,
 }
 
 impl App {
@@ -364,6 +369,7 @@ impl App {
             vu_level: 0.0,
             hide_deadline: hidden
                 .then(|| std::time::Instant::now() + Duration::from_millis(150)),
+            install_after_check: false,
         }
     }
 
@@ -860,7 +866,33 @@ impl eframe::App for App {
             self.set_volume(v);
         }
         if self.control.pending_update.swap(false, Ordering::Relaxed) {
-            self.trigger_install();
+            let known = {
+                let g = self.update.lock().unwrap();
+                matches!(*g, UpdateState::Available(_))
+            };
+            if known {
+                self.trigger_install();
+            } else {
+                // О релизе ещё не знаем — проверим и поставим по результату.
+                self.install_after_check = true;
+                self.start_check();
+            }
+        }
+        if self.install_after_check {
+            let verdict = {
+                let g = self.update.lock().unwrap();
+                match &*g {
+                    UpdateState::Checking => None,
+                    UpdateState::Available(_) => Some(true),
+                    _ => Some(false),
+                }
+            };
+            if let Some(has_update) = verdict {
+                self.install_after_check = false;
+                if has_update {
+                    self.trigger_install();
+                }
+            }
         }
 
         // Команды трея: показать окно / выйти.
